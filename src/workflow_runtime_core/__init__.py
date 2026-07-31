@@ -42,7 +42,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__: list[str] = [
     "LATEST_VERSION",
