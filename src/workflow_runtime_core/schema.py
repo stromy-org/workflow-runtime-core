@@ -36,15 +36,24 @@ def read_schema_version(conn: DbConnection) -> int | None:
     An absent ``schema_meta`` table is a legitimate answer ("never migrated"),
     not an error — it is exactly what a freshly provisioned database looks like,
     and the caller decides whether that is fatal.
+
+    The probe runs inside a SAVEPOINT because that "legitimate answer" arrives as
+    a Postgres error: selecting from a missing table aborts the *entire*
+    surrounding transaction, so merely catching ``UndefinedTable`` would leave
+    the connection in ``InFailedSqlTransaction`` and every later statement would
+    fail. ``apply_migrations`` calls this while holding its advisory lock in an
+    open transaction, so a bare catch here breaks migrating a fresh database —
+    the single most common case.
     """
     import psycopg
 
-    with conn.cursor() as cur:
-        try:
+    try:
+        with conn.transaction(), conn.cursor() as cur:
             cur.execute("SELECT version FROM schema_meta LIMIT 1")
-        except psycopg.errors.UndefinedTable:
-            return None
-        row = cur.fetchone()
+            row = cur.fetchone()
+    except psycopg.errors.UndefinedTable:
+        # Savepoint rolled back; the outer transaction is still usable.
+        return None
     if not row:
         return None
     return int(row["version"])
