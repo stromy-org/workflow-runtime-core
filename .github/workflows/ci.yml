@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-ci:
+    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
+    with:
+      source_package: "src/workflow_runtime_core"
+    # Forward the org stromy-ci App secrets (CI_APP_ID / CI_APP_PRIVATE_KEY)
+    # so the reusable workflow can clone private deps. No-op if absent.
+    secrets: inherit

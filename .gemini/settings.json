@@ -1,0 +1,6 @@
+{
+  "context": {
+    "fileName": ["AGENTS.md"]
+  },
+  "_comment": "AGENTS.md is canonical; CLAUDE.md and .github/copilot-instructions.md are generated from it by scripts/render-agent-md.py."
+}

@@ -1,0 +1,78 @@
+# Build a sdist+wheel on tag push and attach them to a GitHub Release.
+#
+# Workflow:
+#   1. Bump version in pyproject.toml on main.
+#   2. git tag vX.Y.Z && git push --tags
+#   3. This workflow builds + publishes the release.
+#
+# Consumers depend on a specific tag via:
+#   "<pkg> @ git+https://github.com/stromy-org/workflow-runtime-core.git@vX.Y.Z"
+# so the GitHub Release artifacts are informational — uv reads the source tree
+# at the tagged commit directly. The release page is the human-facing audit
+# trail and changelog anchor.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - name: Build distributions
+        run: uv build
+      - name: Verify tag matches pyproject version
+        run: |
+          PYPROJECT_VERSION="$(uv run python -c 'import tomllib,sys; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PYPROJECT_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject version ${PYPROJECT_VERSION}"
+            exit 1
+          fi
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
+
+      - name: Mint GitHub App token
+        # stromy-ci App token with Contents: write on the consumer repo — lets
+        # this release fire the auto-bump repository_dispatch. Unlike the default
+        # GITHUB_TOKEN, an App token triggers the downstream bump workflow.
+        # See infra-docs/ai/cross-repo-pats.md.
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Notify Stromy,stromy-workflows-mcp to auto-bump the pin
+        # Fires a repository_dispatch event into the listed consumer repo(s).
+        # The bump-internal-lib.yml workflow there opens a PR rewriting the
+        # tag in [tool.uv.sources] and regenerating uv.lock.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO_SLUG: ${{ github.event.repository.name }}
+        run: |
+          gh api repos/stromy-org/Stromy/dispatches \
+            -f event_type=internal-lib-released \
+            -F "client_payload[repo]=${REPO_SLUG}" \
+            -F "client_payload[tag]=${GITHUB_REF_NAME}"
+          gh api repos/stromy-org/stromy-workflows-mcp/dispatches \
+            -f event_type=internal-lib-released \
+            -F "client_payload[repo]=${REPO_SLUG}" \
+            -F "client_payload[tag]=${GITHUB_REF_NAME}"

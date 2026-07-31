@@ -1,0 +1,16 @@
+# Codex project configuration
+# AGENTS.md is auto-loaded as primary instructions.
+
+# ── Instructions ───────────────────────────────────────────
+# If AGENTS.md is missing, try CLAUDE.md
+project_doc_fallback_filenames = ["CLAUDE.md"]
+
+# ── Approval & Sandbox ────────────────────────────────────
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+# ── Reasoning ──────────────────────────────────────────────
+model_reasoning_effort = "high"
+
+# ── Web Search ─────────────────────────────────────────────
+web_search = "cached"

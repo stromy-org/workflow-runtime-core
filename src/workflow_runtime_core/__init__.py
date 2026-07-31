@@ -1,0 +1,72 @@
+"""Client-neutral durable workflow lifecycle.
+
+One lifecycle, three consumers. This package owns the versioned run registry,
+explicit migrations, the schema-compatibility gate, the ``ExecutionBinding``
+seam and the runner; consumers own their graphs, contracts and channels.
+
+Import boundaries
+-----------------
+Everything exported here is in the BASE install and needs only ``psycopg``.
+Graph execution lives in :mod:`workflow_runtime_core.executor` and requires the
+``executor`` extra; broker adapters land in Phase B behind ``rabbitmq``. That
+split is what lets the public workflow facade depend on this package without
+acquiring LangGraph or aio-pika.
+"""
+
+from __future__ import annotations
+
+from .binding import ExecutionBinding
+from .exceptions import (
+    CheckpointerError,
+    DependencyError,
+    MigrationError,
+    RegistryError,
+    SchemaVersionMismatch,
+    WorkflowRuntimeCoreError,
+)
+from .migrations import LATEST_VERSION, MIGRATIONS, Migration, apply_migrations, pending
+from .models import (
+    TERMINAL_STATUS_VALUES,
+    TERMINAL_STATUSES,
+    Run,
+    RunRecord,
+    RunStatus,
+    TerminalProjection,
+    utcnow,
+)
+from .schema import (
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_MAX,
+    SUPPORTED_SCHEMA_MIN,
+    read_schema_version,
+    require_compatible_schema,
+)
+
+__version__ = "0.1.0"
+
+__all__: list[str] = [
+    "LATEST_VERSION",
+    "MIGRATIONS",
+    "SCHEMA_VERSION",
+    "SUPPORTED_SCHEMA_MAX",
+    "SUPPORTED_SCHEMA_MIN",
+    "TERMINAL_STATUSES",
+    "TERMINAL_STATUS_VALUES",
+    "CheckpointerError",
+    "DependencyError",
+    "ExecutionBinding",
+    "Migration",
+    "MigrationError",
+    "RegistryError",
+    "Run",
+    "RunRecord",
+    "RunStatus",
+    "SchemaVersionMismatch",
+    "TerminalProjection",
+    "WorkflowRuntimeCoreError",
+    "apply_migrations",
+    "pending",
+    "read_schema_version",
+    "require_compatible_schema",
+    "utcnow",
+]

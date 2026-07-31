@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workflow-runtime-core"
+version = "0.1.0"
+description = "Client-neutral durable workflow lifecycle: versioned run registry, explicit migrations, execution bindings, leases and transactional outbox"
+readme = "README.md"
+requires-python = ">=3.11"
+# Deliberately NO `license` field. This repository is PUBLIC so that the public
+# workflow facade can install an exact Git tag without private-build credentials
+# (ORG-PLAN-155 locked decision 3) — public visibility is NOT an open-source
+# grant. It matches the source-available posture of the public facade repo
+# `stromy-org/stromy-workflows-mcp`, which also carries no licence. The archetype
+# scaffolds `license = "MIT"`; that grant is removed here on purpose and must not
+# be reintroduced without a separate legal decision (ORG-PLAN-155 task A1).
+authors = [{ name = "William Masquelier", email = "william.masquelier@stromy.com.au" }]
+
+# Base install = registry DML + migration inspection + typed models only. It must
+# stay free of LangGraph and aio-pika: the workflow facade installs exactly this
+# and a dependency audit asserts neither appears (ORG-PLAN-155 task A4).
+dependencies = [
+    "click>=8.0",
+    "psycopg[binary]>=3.2,<4",
+]
+
+[project.optional-dependencies]
+# Graph execution. Pinned to match the Stromy consumer so one resolver satisfies both.
+executor = [
+    "langgraph>=1.0.6,<2",
+    "langgraph-checkpoint>=4.1.0,<5",
+    "langgraph-checkpoint-postgres>=3.0.5,<4",
+]
+# Delivery-bearing ingress / confirmed egress adapters (Phase B).
+rabbitmq = [
+    "aio-pika>=9.4,<10",
+]
+# Fault-injection + real-broker/database fixtures for consumers reusing our harness.
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "testcontainers[postgres]>=4.8.0",
+]
+all = ["workflow-runtime-core[executor,rabbitmq,test]"]
+
+# PEP 735 dependency-groups — installed by default with `uv sync` (no --extra needed).
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "pyright>=1.1",
+]
+
+
+[project.scripts]
+wrc = "workflow_runtime_core.cli:main"
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workflow_runtime_core"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "PERF", "S", "E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src/workflow_runtime_core"]
+# Click is partially typed — relax for the CLI entry point only.
+exclude = ["src/workflow_runtime_core/cli.py"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: Fast, isolated unit tests",
+    "contract: Public API contract stability tests",
+    "integration: End-to-end tests",
+    # Add `requires_<dep>` markers as you add optional-dependency-gated tests.
+]

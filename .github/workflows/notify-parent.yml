@@ -1,0 +1,44 @@
+# Notify stromy-org on push to main so it can auto-bump this submodule's pointer.
+#
+# Auth: the org-wide `stromy-ci` GitHub App (secrets CI_APP_ID / CI_APP_PRIVATE_KEY) —
+# the same App every other cross-repo workflow uses, so there is no per-repo PAT to
+# create or expire. The App is installed on all repos with Contents: write, which
+# covers creating a repository_dispatch on stromy-org. See infra-docs/ai/cross-repo-pats.md.
+#
+# Public repos (plugins, marketplaces) cannot read the CI_APP secrets — org-secret
+# visibility is private-repos-only, and broadening a Contents:write-on-all-repos key
+# to public repos is a deliberate no. There the token mint is skipped and the bump
+# falls back to stromy-org's daily 04:00 UTC cron (degraded but functional).
+name: Notify parent on push to main
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint stromy-ci App token
+        id: app-token
+        continue-on-error: true   # public repos have no CI_APP access -> fall to cron
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Fire submodule-bumped event into stromy-org
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "No stromy-ci App token (public repo without CI_APP access); relying on stromy-org daily cron fallback."
+            exit 0
+          fi
+          gh api repos/stromy-org/stromy-org/dispatches \
+            -f event_type=submodule-bumped \
+            -F "client_payload[submodule]=$REPO" \
+            -F "client_payload[sha]=$SHA"

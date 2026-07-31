@@ -1,0 +1,19 @@
+# Copier answers — DO NOT EDIT BY HAND.
+# Run `uvx copier update --skip-answered` to pull template improvements.
+_src_path: /Users/williammasquelier/Repositories/stromy-org/scaffolds/python-library-template
+author_email: william.masquelier@stromy.com.au
+author_name: William Masquelier
+cli_command_name: wrc
+consumer_repos_to_notify: Stromy,stromy-workflows-mcp
+depends_on_internal_libs: false
+description: 'Client-neutral durable workflow lifecycle: versioned run registry, explicit
+    migrations, execution bindings, leases and transactional outbox'
+github_owner: stromy-org
+github_repo: workflow-runtime-core
+has_cli: true
+module_slug: workflow_runtime_core
+optional_extras: executor,rabbitmq,test
+package_slug: workflow-runtime-core
+project_name: Workflow Runtime Core
+python_version: '3.11'
+surface_class: full
