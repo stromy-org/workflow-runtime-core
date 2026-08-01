@@ -24,6 +24,13 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    env:
+      # The `secrets` context is NOT available in a step-level `if:` — using it
+      # there is a workflow COMPILE error, which GitHub reports as a 0s run with
+      # no jobs and no logs rather than as a lint failure. Job-level `env` is one
+      # of the few places `secrets` *is* allowed, so hop through it and let the
+      # steps below test a plain string.
+      HAS_CI_APP: ${{ secrets.CI_APP_ID != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -72,7 +79,7 @@ jobs:
       - name: Mint GitHub App token
         # An App token (unlike the default GITHUB_TOKEN) can trigger the
         # downstream bump workflow. See infra-docs/ai/cross-repo-pats.md.
-        if: ${{ secrets.CI_APP_ID != '' }}
+        if: env.HAS_CI_APP == 'true'
         uses: actions/create-github-app-token@v2
         id: app-token
         with:
@@ -84,7 +91,7 @@ jobs:
         # Fires a repository_dispatch event into the listed consumer repo(s).
         # The bump-internal-lib.yml workflow there opens a PR rewriting the
         # tag in [tool.uv.sources] and regenerating uv.lock.
-        if: ${{ steps.app-token.outputs.token != '' }}
+        if: env.HAS_CI_APP == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO_SLUG: ${{ github.event.repository.name }}
