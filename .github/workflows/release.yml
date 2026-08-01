@@ -48,11 +48,31 @@ jobs:
             --generate-notes \
             dist/*
 
+      # ---------------------------------------------------------------------
+      # Consumer auto-bump — DISABLED-BY-ABSENCE on this repo, deliberately.
+      #
+      # The steps below need the org `stromy-ci` App credential. That org secret
+      # is `visibility: selected`, and every one of the ~46 repositories on its
+      # allowlist is PRIVATE. This repository is PUBLIC (ORG-PLAN-155 locked
+      # decision 3, so the public workflow facade can install an exact tag with
+      # no build credential), so allowlisting it would put a broad org-wide
+      # Contents:write credential into a public repo's workflow surface for the
+      # first time. That is a security-posture decision for the operator, not a
+      # provisioning detail for a release job — so the credential is absent and
+      # these steps SKIP rather than fail.
+      #
+      # Nothing is lost: ORG-PLAN-155 locked decision 4 pins consumers to exact
+      # immutable tags committed by hand, so an auto-bump PR would be rewriting
+      # a pin this design deliberately sets. Bump consumers with an explicit
+      # edit to `[tool.uv.sources]` + `uv lock`.
+      #
+      # To re-enable: add this repo to the CI_APP_ID / CI_APP_PRIVATE_KEY
+      # allowlists and the steps light up on the next tag, unchanged.
+      # ---------------------------------------------------------------------
       - name: Mint GitHub App token
-        # stromy-ci App token with Contents: write on the consumer repo — lets
-        # this release fire the auto-bump repository_dispatch. Unlike the default
-        # GITHUB_TOKEN, an App token triggers the downstream bump workflow.
-        # See infra-docs/ai/cross-repo-pats.md.
+        # An App token (unlike the default GITHUB_TOKEN) can trigger the
+        # downstream bump workflow. See infra-docs/ai/cross-repo-pats.md.
+        if: ${{ secrets.CI_APP_ID != '' }}
         uses: actions/create-github-app-token@v2
         id: app-token
         with:
@@ -64,6 +84,7 @@ jobs:
         # Fires a repository_dispatch event into the listed consumer repo(s).
         # The bump-internal-lib.yml workflow there opens a PR rewriting the
         # tag in [tool.uv.sources] and regenerating uv.lock.
+        if: ${{ steps.app-token.outputs.token != '' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO_SLUG: ${{ github.event.repository.name }}
