@@ -37,21 +37,38 @@ def read_schema_version(conn: DbConnection) -> int | None:
     not an error — it is exactly what a freshly provisioned database looks like,
     and the caller decides whether that is fatal.
 
-    The probe runs inside a SAVEPOINT because that "legitimate answer" arrives as
-    a Postgres error: selecting from a missing table aborts the *entire*
-    surrounding transaction, so merely catching ``UndefinedTable`` would leave
-    the connection in ``InFailedSqlTransaction`` and every later statement would
-    fail. ``apply_migrations`` calls this while holding its advisory lock in an
-    open transaction, so a bare catch here breaks migrating a fresh database —
-    the single most common case.
+    **Do not ask this question by catching an exception.** PostgreSQL aborts the
+    *entire* surrounding transaction on any failed statement, so a plain
+    ``SELECT ... EXCEPT UndefinedTable`` returns the right answer while leaving
+    the connection in ``InFailedSqlTransaction`` — every later statement then
+    fails with an error that names neither this function nor the real cause.
+    ``apply_migrations`` calls this while holding its advisory lock inside an
+    open transaction, so that idiom broke migrating a *fresh* database: the one
+    case every new deployment hits and no existing one ever does.
+
+    ``to_regclass`` is the structural fix. It resolves a name to an OID or NULL
+    and **never raises**, so the probe is safe in any transaction state instead
+    of being safe only while someone remembers to wrap it. The savepoint below
+    is then belt-and-braces for the narrow race where the table is dropped
+    between the two statements.
+
+    The same reasoning applies to any "does this object exist?" question against
+    PostgreSQL: prefer a total function (``to_regclass``, ``information_schema``,
+    ``pg_catalog``) over EAFP. See ``tests/integration/test_migrate_fresh_database.py``.
     """
     import psycopg
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('schema_meta') AS oid")
+        probe = cur.fetchone()
+    if probe is None or probe["oid"] is None:
+        return None
 
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute("SELECT version FROM schema_meta LIMIT 1")
             row = cur.fetchone()
-    except psycopg.errors.UndefinedTable:
+    except psycopg.errors.UndefinedTable:  # pragma: no cover - concurrent DROP
         # Savepoint rolled back; the outer transaction is still usable.
         return None
     if not row:
