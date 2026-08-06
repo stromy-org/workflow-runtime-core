@@ -88,7 +88,16 @@ def require_compatible_schema(
     never creates. A process that finds an unservable schema must fail its health
     check rather than serve, because "deploys trail registry migrations" is only
     a rule if something enforces it.
+
+    Beyond the version-range check, this verifies the ``schema_migrations``
+    checksum ledger (B1a, ORG-191): the range check reads a *number*, and a
+    number cannot distinguish two different shapes that both claim it. A
+    :class:`~workflow_runtime_core.exceptions.MigrationChecksumMismatch` here
+    means the database was migrated by a different definition of some version
+    than the one this build carries — fail the health check; do not serve.
     """
+    from .migrations import verify_ledger
+
     live = read_schema_version(conn)
     if live is None:
         raise SchemaVersionMismatch(
@@ -102,6 +111,7 @@ def require_compatible_schema(
             f"[v{minimum}, v{maximum}]. Migrations must land BEFORE the readers "
             "that depend on them; deploy order is migrate-then-deploy."
         )
+    verify_ledger(conn, applied_through=live)
     return live
 
 

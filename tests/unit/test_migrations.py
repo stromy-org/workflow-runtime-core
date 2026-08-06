@@ -1,10 +1,11 @@
 """Migration-ledger unit tests (no database required).
 
-The database-backed serialisation tests — two concurrent migrators, checksum
-mismatch fails closed — arrive with the ``schema_migrations`` ledger in Phase B.
-What is testable now is the part that must never drift silently: the set of known
-migrations, the pending calculation that decides whether an operator has work to
-do, and the refusal to touch a database newer than this build.
+The database-backed checksum-mismatch and serialisation behaviour lives in
+``tests/integration/test_migration_ledger.py``. What is testable here is the
+part that must never drift silently: the set of known migrations, the pending
+calculation that decides whether an operator has work to do, the refusal to
+touch a database newer than this build, and the app-chain input validation
+that rejects bad namespaces/version sequences before any SQL runs.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from workflow_runtime_core.exceptions import MigrationError
 from workflow_runtime_core.migrations import (
     LATEST_VERSION,
     MIGRATIONS,
+    PRE_LEDGER_MAX_VERSION,
     Migration,
+    apply_app_migrations,
     get_migration,
     pending,
 )
@@ -84,6 +87,43 @@ def test_v1_ddl_creates_the_tables_the_registry_writes() -> None:
     sql = get_migration(1).sql
     for table in ("schema_meta", "runs", "run_events"):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
+
+
+@pytest.mark.unit
+def test_pre_ledger_era_is_pinned_to_v1() -> None:
+    """The amnesty boundary marks the pre-ledger ERA and never moves.
+
+    If this constant ever tracked "the current version", every future migration
+    would grant itself amnesty from the ledger — which is the entire protection.
+    """
+    assert PRE_LEDGER_MAX_VERSION == 1
+
+
+@pytest.mark.unit
+def test_app_chain_rejects_the_core_namespace() -> None:
+    chain = (Migration(version=1, name="x", sql="SELECT 1"),)
+    with pytest.raises(MigrationError, match="invalid app namespace"):
+        apply_app_migrations(None, "core", chain)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["", "Core", "UPPER", "1starts-with-digit", "a b", "x" * 65])
+def test_app_chain_rejects_malformed_namespaces(bad: str) -> None:
+    chain = (Migration(version=1, name="x", sql="SELECT 1"),)
+    with pytest.raises(MigrationError, match="invalid app namespace"):
+        apply_app_migrations(None, bad, chain)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "versions",
+    [(), (2,), (1, 3), (1, 1), (2, 1)],
+    ids=["empty", "starts-at-2", "gap", "duplicate", "descending"],
+)
+def test_app_chain_rejects_non_contiguous_versions(versions: tuple[int, ...]) -> None:
+    chain = tuple(Migration(version=v, name=f"m{i}", sql="SELECT 1") for i, v in enumerate(versions))
+    with pytest.raises(MigrationError, match="contiguous from 1"):
+        apply_app_migrations(None, "facade", chain)  # type: ignore[arg-type]
 
 
 @pytest.mark.unit
