@@ -13,19 +13,34 @@ the previous version. Migration is therefore an explicit operator act
 (``wrc migrate``) run with a migration-scoped identity, while applications only
 call :func:`~workflow_runtime_core.schema.require_compatible_schema`.
 
-Phase A ships migration ``0001`` only, which is byte/behaviour compatible with
+Phase A shipped migration ``0001`` only, which is byte/behaviour compatible with
 the live Stromy schema v1 — applying it to an already-migrated v1 database is a
-no-op. The additive ``0002`` (inbox / launch / outbox / receipts / leases) lands
-in Phase B together with the ``schema_migrations`` checksum ledger.
+no-op.
+
+B1a (ORG-191) adds the ``schema_migrations`` checksum ledger ahead of any
+``0002``: every applied migration's checksum is recorded on apply and verified
+fail-closed on every later apply *and* at application startup. The ledger exists
+because two plans once defined incompatible shapes both called "v2" behind the
+same ``schema_meta.version`` — a number cannot detect that, a content digest
+can (see the 2026-08-06 resolution in ``PLAN_agent-service-scaffold.md``).
+
+The ledger carries a ``namespace`` column for the same reason. The fork happened
+because an application held the pen over shared tables, so the ownership rule is
+now structural: the ``core`` namespace is this module's linear chain and nothing
+else may write it; an application that owns additive tables of its own (for
+example the workflow facade's upload sessions) records them through
+:func:`apply_app_migrations` under its own namespace, in the same ledger, with
+the same fail-closed verification.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .exceptions import MigrationError
+from .exceptions import MigrationChecksumMismatch, MigrationError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .registry import DbConnection
@@ -35,6 +50,34 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # The value is arbitrary but must never change: it IS the mutual-exclusion
 # identity shared across processes and releases.
 MIGRATION_ADVISORY_LOCK_ID = 0x57524301  # "WRC\x01"
+
+#: The ledger namespace owned by this module's ``MIGRATIONS`` chain. Reserved:
+#: :func:`apply_app_migrations` refuses it.
+CORE_NAMESPACE = "core"
+
+#: Core migrations at or below this version may legitimately predate the ledger
+#: itself (v1 databases were migrated by pre-ledger builds, and before the
+#: extraction by Stromy's auto-DDL). Their absent ledger rows are backfilled on
+#: the next ``wrc migrate`` rather than treated as corruption. Anything ABOVE
+#: this version can only have been applied by a ledger-aware build, so a missing
+#: row there is unaccounted history and fails closed. This constant never moves:
+#: it marks the pre-ledger era, not "the current version".
+PRE_LEDGER_MAX_VERSION = 1
+
+#: App namespaces are short, DNS-ish identifiers so they read cleanly in the
+#: ledger and can never collide with ``core`` by case or punctuation games.
+_APP_NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+_LEDGER_DDL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    namespace  TEXT        NOT NULL,
+    version    INTEGER     NOT NULL,
+    name       TEXT        NOT NULL,
+    checksum   TEXT        NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (namespace, version)
+);
+"""
 
 
 _V1_DDL = """
@@ -98,9 +141,9 @@ class Migration:
     def checksum(self) -> str:
         """Stable digest of the SQL body.
 
-        Phase B records this in ``schema_migrations`` and fails closed on a
-        mismatch. Exposing it now means the value a future ledger compares
-        against is computed by the same function that will verify it.
+        Recorded in ``schema_migrations`` on apply and compared fail-closed by
+        :func:`verify_ledger`. Recorded and verified by this same function, so
+        the two can never drift.
         """
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
 
@@ -131,6 +174,107 @@ def pending(current: int | None) -> tuple[Migration, ...]:
     """
     floor = 0 if current is None else current
     return tuple(m for m in MIGRATIONS if m.version > floor)
+
+
+# --- the checksum ledger (B1a, ORG-191) --------------------------------------
+
+
+def ledger_exists(conn: DbConnection) -> bool:
+    """Whether the ``schema_migrations`` ledger table exists.
+
+    Total-function probe (``to_regclass``), never EAFP — this is called from
+    inside open transactions, including the startup gate, and a raising probe
+    aborts its caller's transaction (the v0.1.0 fresh-database bug).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('schema_migrations') AS oid")
+        row = cur.fetchone()
+    return row is not None and row["oid"] is not None
+
+
+def _ledger_rows(conn: DbConnection, namespace: str) -> dict[int, dict[str, str]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT version, name, checksum FROM schema_migrations "
+            "WHERE namespace = %s",
+            (namespace,),
+        )
+        rows = cur.fetchall()
+    return {
+        int(r["version"]): {"name": r["name"], "checksum": r["checksum"]} for r in rows
+    }
+
+
+def verify_ledger(
+    conn: DbConnection,
+    *,
+    namespace: str = CORE_NAMESPACE,
+    migrations: tuple[Migration, ...] = MIGRATIONS,
+    applied_through: int | None = None,
+) -> None:
+    """Assert the recorded migration history is consistent with this build.
+
+    Read-only, safe in any transaction state. Raises
+    :class:`MigrationChecksumMismatch` when:
+
+    - a recorded migration's checksum differs from this build's definition of
+      the same ``(namespace, version)`` — the two-shapes-one-number failure; or
+    - a version above :data:`PRE_LEDGER_MAX_VERSION` was applied
+      (``applied_through``) with no ledger row — unaccounted history that only a
+      foreign, ledger-less build could have produced.
+
+    Tolerated, deliberately: an absent ledger table or absent rows for
+    pre-ledger-era versions (``<= PRE_LEDGER_MAX_VERSION``) while nothing newer
+    was applied — that is what every healthy pre-B1a database looks like, and
+    the next ``wrc migrate`` backfills it. Ledger rows for versions this build
+    does not know are skipped: "newer than me" is the range gate's question,
+    not the ledger's.
+
+    ``applied_through`` is the highest version known to be applied in this
+    namespace — ``schema_meta.version`` for the core chain. App chains pass
+    ``None``: the ledger itself is their only record of application.
+    """
+    known = {m.version: m for m in migrations}
+
+    if not ledger_exists(conn):
+        if applied_through is not None and applied_through > PRE_LEDGER_MAX_VERSION:
+            raise MigrationChecksumMismatch(
+                f"schema is at v{applied_through} (namespace {namespace!r}) but the "
+                "schema_migrations ledger does not exist. Versions beyond "
+                f"v{PRE_LEDGER_MAX_VERSION} are only ever applied by ledger-aware "
+                "builds, so this history is unaccounted — refusing to trust the "
+                "version number alone."
+            )
+        return
+
+    recorded = _ledger_rows(conn, namespace)
+
+    for version, row in sorted(recorded.items()):
+        expected = known.get(version)
+        if expected is None:
+            continue
+        if row["checksum"] != expected.checksum:
+            raise MigrationChecksumMismatch(
+                f"migration v{version} (namespace {namespace!r}) was applied as "
+                f"{row['name']!r} sha256={row['checksum'][:12]}…, but this build "
+                f"defines it as {expected.name!r} sha256={expected.checksum[:12]}…. "
+                "The database was migrated by a DIFFERENT definition of the same "
+                "version; serving against it would silently misread the schema. "
+                "Deploy the build whose migrations match this history."
+            )
+
+    if applied_through is not None:
+        # Every applied version beyond the pre-ledger era needs a row — including
+        # versions this build does not know, which is precisely the state a
+        # ledger-less foreign build leaves behind.
+        for version in range(PRE_LEDGER_MAX_VERSION + 1, applied_through + 1):
+            if version not in recorded:
+                raise MigrationChecksumMismatch(
+                    f"schema is at v{applied_through} (namespace {namespace!r}) but "
+                    f"the ledger has no row for v{version}. A version beyond "
+                    f"v{PRE_LEDGER_MAX_VERSION} can only be applied by a "
+                    "ledger-aware build, so this history is unaccounted."
+                )
 
 
 def apply_migrations(
@@ -169,6 +313,28 @@ def apply_migrations(
                 "deploy a newer workflow-runtime-core instead."
             )
 
+        # Verify recorded history BEFORE creating anything: a divergent past must
+        # stop the migrator, not gain a ledger that legitimises it. (On a fresh
+        # or pre-ledger database this is the tolerated-absent path.)
+        verify_ledger(conn, applied_through=live)
+
+        cur.execute(_LEDGER_DDL)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+        # Backfill the pre-ledger era: rows for already-applied versions that
+        # legitimately predate the ledger. One-time amnesty, bounded by
+        # PRE_LEDGER_MAX_VERSION — verify_ledger above already refused anything
+        # newer with unaccounted history.
+        for m in MIGRATIONS:
+            if m.version <= (live or 0) and m.version <= PRE_LEDGER_MAX_VERSION:
+                cur.execute(
+                    """
+                    INSERT INTO schema_migrations (namespace, version, name, checksum)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (namespace, version) DO NOTHING
+                    """,
+                    (CORE_NAMESPACE, m.version, m.name, m.checksum),
+                )
+
         todo = [m for m in pending(live) if m.version <= ceiling]
         if not todo:
             return live if live is not None else 0
@@ -180,6 +346,13 @@ def apply_migrations(
             # pyright resolves the bare-string call to psycopg's t-string
             # `Template` overload; the str form is correct at runtime.
             cur.execute(migration.sql)  # pyright: ignore[reportArgumentType, reportCallIssue]
+            cur.execute(
+                """
+                INSERT INTO schema_migrations (namespace, version, name, checksum)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (CORE_NAMESPACE, migration.version, migration.name, migration.checksum),
+            )
 
         applied = todo[-1].version
         cur.execute(
@@ -192,3 +365,75 @@ def apply_migrations(
             (applied,),
         )
     return applied
+
+
+# --- app-owned chains ---------------------------------------------------------
+
+
+def read_app_version(conn: DbConnection, namespace: str) -> int | None:
+    """Highest applied version in an app namespace, or ``None`` if none.
+
+    App chains have no ``schema_meta`` row — the ledger IS their record.
+    """
+    if not ledger_exists(conn):
+        return None
+    rows = _ledger_rows(conn, namespace)
+    return max(rows) if rows else None
+
+
+def apply_app_migrations(
+    conn: DbConnection,
+    namespace: str,
+    migrations: tuple[Migration, ...],
+) -> int:
+    """Apply an application-owned additive chain under its own ledger namespace.
+
+    The ownership rule this enforces (2026-08-06 fork resolution): the ``core``
+    namespace belongs to this module's chain alone, so an application that owns
+    tables of its own — the workflow facade's upload sessions are the motivating
+    case — records them here instead of minting a competing ``schema_meta``
+    version. Same advisory lock, same checksum verification, same fail-closed
+    posture; ``schema_meta`` is never touched.
+
+    App chains are ADDITIVE BY CONTRACT: they create and evolve the
+    application's own objects and must never alter a core-owned table. That
+    contract is documentation-and-review enforced — SQL cannot cheaply prove it —
+    which is exactly why the chain is named in the ledger: a violation has an
+    attributable author.
+    """
+    if namespace == CORE_NAMESPACE or not _APP_NAMESPACE_RE.match(namespace):
+        raise MigrationError(
+            f"invalid app namespace {namespace!r}: must match "
+            f"{_APP_NAMESPACE_RE.pattern} and must not be {CORE_NAMESPACE!r}"
+        )
+    versions = [m.version for m in migrations]
+    if not versions or versions != list(range(1, len(versions) + 1)):
+        raise MigrationError(
+            f"app chain {namespace!r} versions must be contiguous from 1, got "
+            f"{versions} — a gap makes the pending calculation silently skip a step"
+        )
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_ADVISORY_LOCK_ID,))
+
+        verify_ledger(conn, namespace=namespace, migrations=migrations)
+
+        cur.execute(_LEDGER_DDL)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+        recorded = _ledger_rows(conn, namespace)
+        floor = max(recorded) if recorded else 0
+        todo = [m for m in migrations if m.version > floor]
+        if not todo:
+            return floor
+
+        for migration in todo:
+            cur.execute(migration.sql)  # pyright: ignore[reportArgumentType, reportCallIssue]
+            cur.execute(
+                """
+                INSERT INTO schema_migrations (namespace, version, name, checksum)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (namespace, migration.version, migration.name, migration.checksum),
+            )
+
+    return todo[-1].version

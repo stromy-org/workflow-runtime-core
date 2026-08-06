@@ -17,7 +17,15 @@ import json as _json
 import click
 
 from . import registry, schema
-from .migrations import LATEST_VERSION, MIGRATIONS, apply_migrations, pending
+from .exceptions import MigrationChecksumMismatch
+from .migrations import (
+    LATEST_VERSION,
+    MIGRATIONS,
+    apply_migrations,
+    ledger_exists,
+    pending,
+    verify_ledger,
+)
 
 _dsn_option = click.option(
     "--dsn",
@@ -84,7 +92,21 @@ def status(dsn: str | None, as_json: bool) -> None:
         live = schema.read_schema_version(conn)
         todo = pending(live)
 
-    compatible = live is not None and (
+        # Report ledger health without serving through it: a mismatch must be
+        # visible to an operator running `wrc status`, not only to a crashing app.
+        if not ledger_exists(conn):
+            ledger = "absent (pre-ledger; next migrate backfills it)"
+            ledger_ok = live is None or live <= 1
+        else:
+            try:
+                verify_ledger(conn, applied_through=live)
+                ledger = "ok"
+                ledger_ok = True
+            except MigrationChecksumMismatch as exc:
+                ledger = f"MISMATCH — {exc}"
+                ledger_ok = False
+
+    compatible = ledger_ok and live is not None and (
         schema.SUPPORTED_SCHEMA_MIN <= live <= schema.SUPPORTED_SCHEMA_MAX
     )
     if as_json:
@@ -98,6 +120,7 @@ def status(dsn: str | None, as_json: bool) -> None:
                         schema.SUPPORTED_SCHEMA_MAX,
                     ],
                     "compatible": compatible,
+                    "ledger": ledger,
                     "pending": [{"version": m.version, "name": m.name} for m in todo],
                 },
                 indent=2,
@@ -110,6 +133,7 @@ def status(dsn: str | None, as_json: bool) -> None:
             f"v{schema.SUPPORTED_SCHEMA_MAX}]"
         )
         click.echo(f"compatible:       {'yes' if compatible else 'NO'}")
+        click.echo(f"ledger:           {ledger}")
         click.echo(
             "pending:          "
             + (", ".join(f"v{m.version} {m.name}" for m in todo) if todo else "none")

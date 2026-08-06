@@ -19,12 +19,23 @@ from .binding import ExecutionBinding
 from .exceptions import (
     CheckpointerError,
     DependencyError,
+    MigrationChecksumMismatch,
     MigrationError,
     RegistryError,
     SchemaVersionMismatch,
     WorkflowRuntimeCoreError,
 )
-from .migrations import LATEST_VERSION, MIGRATIONS, Migration, apply_migrations, pending
+from .migrations import (
+    CORE_NAMESPACE,
+    LATEST_VERSION,
+    MIGRATIONS,
+    Migration,
+    apply_app_migrations,
+    apply_migrations,
+    pending,
+    read_app_version,
+    verify_ledger,
+)
 from .models import (
     TERMINAL_STATUS_VALUES,
     TERMINAL_STATUSES,
@@ -42,9 +53,10 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.4"
 
 __all__: list[str] = [
+    "CORE_NAMESPACE",
     "LATEST_VERSION",
     "MIGRATIONS",
     "SCHEMA_VERSION",
@@ -56,6 +68,7 @@ __all__: list[str] = [
     "DependencyError",
     "ExecutionBinding",
     "Migration",
+    "MigrationChecksumMismatch",
     "MigrationError",
     "RegistryError",
     "Run",
@@ -64,9 +77,12 @@ __all__: list[str] = [
     "SchemaVersionMismatch",
     "TerminalProjection",
     "WorkflowRuntimeCoreError",
+    "apply_app_migrations",
     "apply_migrations",
     "pending",
+    "read_app_version",
     "read_schema_version",
     "require_compatible_schema",
     "utcnow",
+    "verify_ledger",
 ]

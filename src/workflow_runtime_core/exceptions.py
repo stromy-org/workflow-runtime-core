@@ -36,6 +36,20 @@ class MigrationError(WorkflowRuntimeCoreError, RuntimeError):
     """A migration could not be applied, or the recorded history is inconsistent."""
 
 
+class MigrationChecksumMismatch(MigrationError):
+    """The ledger's recorded history contradicts this build's migrations.
+
+    This is the fail-closed signal the ``schema_migrations`` ledger exists to
+    produce (ORG-191): a database whose applied migration N has a different
+    checksum than this build's migration N was migrated by a *different*
+    definition of N. Serving against it means silently misreading a shape the
+    version number cannot distinguish — the exact failure mode of the
+    ORG-PLAN-155/164 schema-v2 fork. Never caught and continued past; the only
+    recoveries are deploying the build whose history matches, or an explicit,
+    human-reviewed ledger repair.
+    """
+
+
 class DependencyError(WorkflowRuntimeCoreError, ImportError):
     """An optional dependency is missing.
 
