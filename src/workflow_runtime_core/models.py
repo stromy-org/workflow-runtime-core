@@ -113,9 +113,25 @@ class RunRecord:
 
         Deliberately omits ``config_json``, ``job_template_json`` and
         ``image_tag``: the rendered job template is an internal secret-bearing
-        surface and must never reach a caller.
+        surface and must never reach a caller. ``lease_owner``, ``lease_expires_at``,
+        ``dispatch_id`` and ``delivery_count`` are omitted for a different reason —
+        they are runner bookkeeping, and a client that could see which worker holds
+        a run learns about our topology without learning anything about its report.
+
+        There is ONE projection, here, rather than a base one plus per-consumer
+        additions. The omissions above are security properties, and a projection
+        assembled in two places is how one of them eventually gets left out of the
+        half nobody re-read.
+
+        The v2 keys appear only when the row actually carries them. An absent key
+        is honest about "this registry cannot tell you"; ``"progress": null`` reads
+        as "no progress yet", which is a different and wrong statement. The attempt
+        block gates on ``workspace_id`` because that column is NOT NULL from
+        migration 0002 onward — it is the reliable "this row has a data plane"
+        marker, where ``attempt_no`` defaults to 1 and so cannot distinguish a v1
+        row from a first attempt.
         """
-        return {
+        payload: dict[str, Any] = {
             "run_id": self.run_id,
             "workflow": self.workflow,
             "status": str(self.status),
@@ -126,6 +142,15 @@ class RunRecord:
             "error": self.error,
             "artifacts": self.artifacts_json,
         }
+        if self.workspace_id is not None:
+            payload["attempt"] = {"attempt_no": self.attempt_no, "retry_of": self.retry_of}
+        if self.progress_json is not None:
+            payload["progress"] = self.progress_json
+        if self.heartbeat_at is not None:
+            payload["heartbeat_at"] = self.heartbeat_at.isoformat()
+        if self.error_json is not None:
+            payload["failure"] = self.error_json
+        return payload
 
 
 #: Historical name used by the extracted Stromy runtime. Kept so consumer code
