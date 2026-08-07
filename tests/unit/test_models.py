@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -93,3 +94,68 @@ def test_terminal_projection_defaults_to_an_empty_outbox() -> None:
     projection = TerminalProjection(status=RunStatus.COMPLETED)
     assert projection.outbox == ()
     assert projection.artifacts is None
+
+
+# --- the v2 keys on the public projection -------------------------------------
+
+
+def _v2_row(**overrides: object) -> dict[str, object]:
+    row = _row(
+        workspace_id="22222222-2222-2222-2222-222222222222",
+        retry_of=None,
+        attempt_no=1,
+        dispatch_id="33333333-3333-3333-3333-333333333333",
+        lease_owner="runner-7",
+        lease_expires_at=_NOW,
+        progress_json={"current_node": "scoring", "completed_nodes": ["load"]},
+        error_json=None,
+        heartbeat_at=_NOW,
+        delivery_count=2,
+    )
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.unit
+def test_public_omits_the_data_plane_keys_on_a_v1_row() -> None:
+    """An absent key says "this registry cannot tell you"; a null one says "not
+    yet", which is a different and wrong statement."""
+    payload = RunRecord.from_row(_row()).public()
+    assert "attempt" not in payload
+    assert "progress" not in payload
+    assert "heartbeat_at" not in payload
+    assert "failure" not in payload
+    # The v1 surface itself is untouched.
+    assert payload["run_id"] and payload["status"] == "queued"
+
+
+@pytest.mark.unit
+def test_public_exposes_the_data_plane_keys_on_a_v2_row() -> None:
+    payload = RunRecord.from_row(_v2_row()).public()
+    assert payload["attempt"] == {"attempt_no": 1, "retry_of": None}
+    assert payload["progress"]["current_node"] == "scoring"
+    assert payload["heartbeat_at"] == _NOW.isoformat()
+
+
+@pytest.mark.unit
+def test_public_never_leaks_lease_or_dispatch_internals() -> None:
+    """Lease ownership is runner bookkeeping. A client that learns which worker
+    holds its run learns about our topology and nothing about its report."""
+    payload = json.dumps(RunRecord.from_row(_v2_row()).public(), default=str)
+    for secret in ("lease_owner", "runner-7", "dispatch_id", "delivery_count"):
+        assert secret not in payload
+
+
+@pytest.mark.unit
+def test_a_structured_failure_surfaces_under_its_own_key() -> None:
+    failure = {"stage": "artifacts", "error_type": "Boom", "retryable": True}
+    payload = RunRecord.from_row(_v2_row(error_json=failure)).public()
+    assert payload["failure"] == failure
+
+
+@pytest.mark.unit
+def test_the_attempt_block_gates_on_workspace_not_attempt_no() -> None:
+    """``attempt_no`` defaults to 1, so it cannot tell a v1 row from a first
+    attempt. ``workspace_id`` is NOT NULL from migration 0002 onward."""
+    assert "attempt" not in RunRecord.from_row(_row(attempt_no=1)).public()
+    assert "attempt" in RunRecord.from_row(_v2_row(attempt_no=1)).public()
