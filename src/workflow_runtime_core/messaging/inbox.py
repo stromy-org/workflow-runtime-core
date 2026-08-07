@@ -174,26 +174,52 @@ def run_for_source(
 
 
 def purge_inbox(
-    conn: DbConnection, *, service_namespace: str, older_than_days: int = 30
+    conn: DbConnection,
+    *,
+    service_namespace: str,
+    older_than_days: int = 30,
+    dry_run: bool = False,
 ) -> int:
     """Delete inbox rows for terminal runs older than the retention window.
 
     Scoped to terminal runs on purpose: age alone is not a safe predicate,
     because a paused run legitimately waits for a human far longer than the
     retention window and still needs its envelope to resume.
+
+    ``dry_run`` counts what would go using the SAME predicate rather than a
+    re-typed copy of it. A preview that can disagree with the deletion it
+    previews is worse than no preview.
     """
     from ..models import TERMINAL_STATUS_VALUES
 
+    # One WHERE clause, used verbatim by both the count and the delete. Written
+    # with EXISTS rather than a join precisely so the two statements can share
+    # it character-for-character — a DELETE ... USING and a SELECT ... JOIN
+    # would need different text, and a preview that can drift from the deletion
+    # it previews is worse than no preview.
+    where = """
+         WHERE service_namespace = %s
+           AND received_at < now() - make_interval(days => %s)
+           AND EXISTS (
+                 SELECT 1 FROM runs r
+                  WHERE r.run_id = event_inbox.run_id
+                    AND r.status = ANY(%s)
+               )
+    """
+    params = (service_namespace, older_than_days, list(TERMINAL_STATUS_VALUES))
+
     with conn.cursor() as cur:
+        if dry_run:
+            # noqa on the concatenation itself: `where` is a module-local
+            # literal and every value is bound as a parameter.
+            cur.execute(
+                "SELECT count(*) AS n FROM event_inbox" + where,  # noqa: S608
+                params,
+            )
+            row = cur.fetchone()
+            return 0 if row is None else int(row["n"])
         cur.execute(
-            """
-            DELETE FROM event_inbox i
-             USING runs r
-             WHERE i.run_id = r.run_id
-               AND i.service_namespace = %s
-               AND i.received_at < now() - make_interval(days => %s)
-               AND r.status = ANY(%s)
-            """,
-            (service_namespace, older_than_days, list(TERMINAL_STATUS_VALUES)),
+            "DELETE FROM event_inbox" + where,  # noqa: S608
+            params,
         )
         return cur.rowcount

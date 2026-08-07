@@ -463,6 +463,51 @@ def test_an_uncertain_receipt_is_resolved_explicitly(blank_dsn: str) -> None:
 
 
 @pytest.mark.integration
+def test_the_purge_dry_run_matches_what_the_purge_deletes(blank_dsn: str) -> None:
+    """A preview that can disagree with the deletion it previews is worse than
+    no preview — an operator would approve one number and get another."""
+    _migrated(blank_dsn)
+    result = _submit(blank_dsn, _envelope())
+    with registry.connect(blank_dsn) as conn:
+        registry.claim_run(conn, result.run_id)
+        registry.mark_completed(conn, result.run_id, {"ok": True})
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE event_inbox SET received_at = now() - interval '400 days'"
+            )
+
+        previewed = inbox.purge_inbox(
+            conn, service_namespace=NS, older_than_days=30, dry_run=True
+        )
+        deleted = inbox.purge_inbox(conn, service_namespace=NS, older_than_days=30)
+
+    assert previewed == 1
+    assert deleted == previewed
+
+
+@pytest.mark.integration
+def test_retention_never_deletes_an_undelivered_message(blank_dsn: str) -> None:
+    """Age is not a licence to drop work still owed. An undelivered outbox row
+    is not retention's business at any age."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        outbox.enqueue(
+            conn,
+            OutboxMessage(
+                service_namespace=NS, message_id="m-owed", destination="whatsapp.reply"
+            ),
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE event_outbox SET created_at = now() - interval '400 days'"
+            )
+        assert (
+            outbox.purge_delivered(conn, service_namespace=NS, older_than_days=30) == 0
+        )
+        assert outbox.pending_depth(conn, service_namespace=NS) == 1
+
+
+@pytest.mark.integration
 def test_purge_keeps_a_paused_runs_envelope(blank_dsn: str) -> None:
     """Age alone is not a safe predicate: a paused run waits on a human for
     longer than the retention window and still needs its envelope to resume."""

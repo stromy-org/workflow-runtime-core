@@ -303,17 +303,36 @@ def oldest_pending_age_seconds(
 
 
 def purge_delivered(
-    conn: DbConnection, *, service_namespace: str, older_than_days: int = 30
+    conn: DbConnection,
+    *,
+    service_namespace: str,
+    older_than_days: int = 30,
+    dry_run: bool = False,
 ) -> int:
-    """Delete delivered messages past the retention window."""
+    """Delete delivered messages past the retention window.
+
+    Only ``delivered`` rows: anything still owed is not retention's business at
+    any age, and deleting an undelivered message is the one mistake this whole
+    subsystem exists to prevent.
+    """
+    where = """
+         WHERE service_namespace = %s
+           AND status = 'delivered'
+           AND delivered_at < now() - make_interval(days => %s)
+    """
+    params = (service_namespace, older_than_days)
     with conn.cursor() as cur:
+        if dry_run:
+            # noqa on the concatenation itself: `where` is a module-local
+            # literal and every value is bound as a parameter.
+            cur.execute(
+                "SELECT count(*) AS n FROM event_outbox" + where,  # noqa: S608
+                params,
+            )
+            row = cur.fetchone()
+            return 0 if row is None else int(row["n"])
         cur.execute(
-            """
-            DELETE FROM event_outbox
-             WHERE service_namespace = %s
-               AND status = 'delivered'
-               AND delivered_at < now() - make_interval(days => %s)
-            """,
-            (service_namespace, older_than_days),
+            "DELETE FROM event_outbox" + where,  # noqa: S608
+            params,
         )
         return cur.rowcount
