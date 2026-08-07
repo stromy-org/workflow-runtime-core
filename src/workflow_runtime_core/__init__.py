@@ -15,11 +15,12 @@ acquiring LangGraph or aio-pika.
 
 from __future__ import annotations
 
-from .binding import ExecutionBinding
+from .binding import ExecutionBinding, LeaseRenewer
 from .exceptions import (
     ActiveAttemptExists,
     CheckpointerError,
     DependencyError,
+    LeaseLost,
     MigrationChecksumMismatch,
     MigrationError,
     RegistryError,
@@ -54,7 +55,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
@@ -68,6 +69,8 @@ __all__: list[str] = [
     "CheckpointerError",
     "DependencyError",
     "ExecutionBinding",
+    "LeaseLost",
+    "LeaseRenewer",
     "Migration",
     "MigrationChecksumMismatch",
     "MigrationError",
