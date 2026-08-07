@@ -149,5 +149,139 @@ def list_migrations() -> None:
         click.echo(f"v{m.version}  {m.name}  sha256={m.checksum}")
 
 
+_namespace_option = click.option(
+    "--namespace",
+    required=True,
+    help="Service namespace to operate on (immutable per service).",
+)
+
+
+@main.command()
+@_dsn_option
+def reconcile(dsn: str | None) -> None:
+    """Recover work stranded by a crashed dispatcher, publisher or sender.
+
+    Each of the three has a different correct recovery, which is why this is one
+    command and not a loop over a generic 'stuck' state:
+
+    * a stranded LAUNCH goes back to pending — it may never have started;
+    * a stranded PUBLISH goes back to the retry schedule — a redelivery of the
+      same stable message id is survivable;
+    * a stranded SEND becomes ``uncertain`` — the provider may already have it,
+      so retrying could double-send to a real person.
+    """
+    from .messaging import launches, outbox, receipts
+
+    with registry.connect(dsn) as conn:
+        relaunched = launches.reconcile_stale(conn)
+        republished = outbox.reconcile_stale(conn)
+        unresolved = receipts.reconcile_stale(conn)
+
+    click.echo(f"launches returned to pending:   {len(relaunched)}")
+    click.echo(f"outbox rows returned to retry:  {len(republished)}")
+    click.echo(f"sends marked uncertain:         {len(unresolved)}")
+    if unresolved:
+        click.echo(
+            "\nThose sends are NOT retried automatically — their provider outcome is "
+            "unobservable. Review them with `wrc uncertain --namespace <ns>` and settle "
+            "each against the provider's own record."
+        )
+
+
+@main.command()
+@_dsn_option
+@_namespace_option
+@click.option("--limit", type=int, default=100, show_default=True)
+def uncertain(dsn: str | None, namespace: str, limit: int) -> None:
+    """List deliveries whose provider outcome could not be observed.
+
+    Exits non-zero when the list is non-empty so a monitoring job can alert on
+    it directly. A non-empty worklist is not an error in the system; it is work
+    owed to a human, and the exit code says so.
+    """
+    from .messaging import receipts
+
+    with registry.connect(dsn) as conn:
+        rows = receipts.list_uncertain(conn, service_namespace=namespace, limit=limit)
+
+    if not rows:
+        click.echo("no uncertain deliveries")
+        return
+    click.echo(f"{len(rows)} uncertain delivery(ies) in {namespace!r}:")
+    for r in rows:
+        click.echo(
+            f"  {r.updated_at:%Y-%m-%d %H:%M}  {r.destination}  {r.message_id}  "
+            f"attempts={r.attempts}  {r.last_error or ''}"
+        )
+    raise SystemExit(1)
+
+
+@main.command()
+@_dsn_option
+@_namespace_option
+@click.option(
+    "--older-than-days",
+    type=int,
+    default=30,
+    show_default=True,
+    help="Retention window. Per-client overrides may only SHORTEN this.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Report what would be deleted and exit without deleting anything.",
+)
+def purge(dsn: str | None, namespace: str, older_than_days: int, dry_run: bool) -> None:
+    """Delete inbox/outbox payloads past the retention window.
+
+    Deletion order is dependency order, and the predicates are deliberately
+    narrow: inbox rows go only for runs that actually reached a terminal state
+    (a paused run waits on a human far longer than any retention window and
+    still needs its envelope to resume), and outbox rows go only once
+    ``delivered``. Counts only — no message bodies are emitted, because this
+    output goes to logs.
+    """
+    from .messaging import inbox, outbox
+
+    with registry.connect(dsn) as conn:
+        inbox_rows = inbox.purge_inbox(
+            conn,
+            service_namespace=namespace,
+            older_than_days=older_than_days,
+            dry_run=dry_run,
+        )
+        outbox_rows = outbox.purge_delivered(
+            conn,
+            service_namespace=namespace,
+            older_than_days=older_than_days,
+            dry_run=dry_run,
+        )
+
+    verb = "would delete" if dry_run else "deleted"
+    click.echo(f"{verb} {inbox_rows} inbox row(s) and {outbox_rows} outbox row(s)")
+    if dry_run:
+        click.echo("dry run — nothing deleted")
+
+
+@main.command("outbox-status")
+@_dsn_option
+@_namespace_option
+def outbox_status(dsn: str | None, namespace: str) -> None:
+    """Report undelivered depth and the age of the oldest owed message.
+
+    Age, not just depth, is the number that catches a stuck lane: a steady depth
+    of five is healthy throughput, while a depth of one that is four hours old
+    is an outage.
+    """
+    from .messaging import outbox
+
+    with registry.connect(dsn) as conn:
+        depth = outbox.pending_depth(conn, service_namespace=namespace)
+        age = outbox.oldest_pending_age_seconds(conn, service_namespace=namespace)
+
+    click.echo(f"undelivered:  {depth}")
+    click.echo(f"oldest age:   {'-' if age is None else f'{age:.0f}s'}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     main()
