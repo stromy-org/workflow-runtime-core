@@ -239,6 +239,21 @@ def test_structured_failure_clears_the_lease(blank_dsn: str) -> None:
 
 
 @pytest.mark.integration
+def test_an_input_set_binds_to_its_run(blank_dsn: str) -> None:
+    """The facade owns the upload tables; the core owns this column. A consumer
+    reaching across to update it with its own SQL is the coupling the ownership
+    rule prevents."""
+    _migrated(blank_dsn)
+    input_set = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_input_set(conn, run.run_id, input_set)
+        bound = registry.get_run(conn, run.run_id)
+    assert bound is not None
+    assert bound.input_set_id == input_set
+
+
+@pytest.mark.integration
 def test_progress_snapshot_round_trips(blank_dsn: str) -> None:
     _migrated(blank_dsn)
     with registry.connect(blank_dsn) as conn:
@@ -294,6 +309,8 @@ def test_v2_only_calls_fail_with_the_named_error_on_v1(blank_dsn: str) -> None:
             )
         with pytest.raises(SchemaVersionMismatch, match="requires schema v2"):
             registry.set_dispatch(conn, run.run_id, str(uuid.uuid4()))
+        with pytest.raises(SchemaVersionMismatch, match="requires schema v2"):
+            registry.set_input_set(conn, run.run_id, str(uuid.uuid4()))
         with pytest.raises(SchemaVersionMismatch, match="requires schema v2"):
             registry.renew_lease(conn, run_id=run.run_id, owner="w1", lease_seconds=60)
         with pytest.raises(SchemaVersionMismatch, match="requires schema v2"):

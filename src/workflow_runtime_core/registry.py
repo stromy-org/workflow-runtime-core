@@ -363,6 +363,29 @@ def set_dispatch(conn: DbConnection, run_id: str, dispatch_id: str) -> None:
         _require_data_plane_column(exc, "set_dispatch")
 
 
+def set_input_set(conn: DbConnection, run_id: str, input_set_id: str) -> None:
+    """Bind an attached input set to a run.
+
+    Sibling of :func:`set_dispatch`, and here for the same reason: ``input_set_id``
+    is a column on ``runs``, so the core owns writes to it. A consumer that owns
+    the *upload* tables (the workflow facade does) still must not reach across and
+    update a core column with its own SQL — that is the coupling the 2026-08-06
+    ownership rule exists to prevent, and the direction it fails in is silent.
+
+    Called inside the caller's transaction, after the run row exists: the run
+    cannot reference an input set it does not own, because ownership is verified
+    in that same transaction and a failure rolls both back.
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET input_set_id = %s, updated_at = now() WHERE run_id = %s",
+                (input_set_id, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "set_input_set")
+
+
 def mark_dispatch_failed(conn: DbConnection, run_id: str, reason: str) -> None:
     """Enqueue failed after the row was committed.
 

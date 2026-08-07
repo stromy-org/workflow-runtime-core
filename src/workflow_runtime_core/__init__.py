@@ -56,7 +56,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
