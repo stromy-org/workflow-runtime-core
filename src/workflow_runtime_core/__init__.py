@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from .binding import ExecutionBinding
 from .exceptions import (
+    ActiveAttemptExists,
     CheckpointerError,
     DependencyError,
     MigrationChecksumMismatch,
@@ -77,6 +78,7 @@ __all__: list[str] = [
     "SchemaVersionMismatch",
     "TerminalProjection",
     "WorkflowRuntimeCoreError",
+    "ActiveAttemptExists",
     "apply_app_migrations",
     "apply_migrations",
     "pending",

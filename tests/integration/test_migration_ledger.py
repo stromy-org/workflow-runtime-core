@@ -11,10 +11,6 @@ in transaction/DDL behaviour a mock cannot reproduce.
 
 from __future__ import annotations
 
-import itertools
-import os
-
-import psycopg
 import pytest
 
 from workflow_runtime_core import registry
@@ -31,34 +27,6 @@ from workflow_runtime_core.migrations import (
     verify_ledger,
 )
 from workflow_runtime_core.schema import require_compatible_schema
-
-_DSN_ENV = "STROMY_PG_DSN"
-_counter = itertools.count(1)
-
-
-@pytest.fixture(scope="module")
-def admin_dsn():
-    """A reachable PostgreSQL with permission to CREATE DATABASE."""
-    provided = os.environ.get(_DSN_ENV, "").strip()
-    if provided:
-        yield provided
-        return
-    testcontainers = pytest.importorskip(
-        "testcontainers.postgres",
-        reason=f"neither {_DSN_ENV} nor testcontainers is available",
-    )
-    with testcontainers.PostgresContainer("postgres:16-alpine") as pg:
-        yield pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
-
-
-@pytest.fixture
-def blank_dsn(admin_dsn: str):
-    """A brand-new empty database per test, so tests cannot order-couple."""
-    name = f"ledger_test_{next(_counter)}"
-    with psycopg.connect(admin_dsn, autocommit=True) as conn:
-        conn.execute(f'CREATE DATABASE "{name}"')
-    head, _, _tail = admin_dsn.rpartition("/")
-    yield f"{head}/{name}"
 
 
 def _tamper_checksum(dsn: str, namespace: str, version: int, value: str) -> None:
@@ -120,7 +88,7 @@ def test_two_shapes_one_number_is_detected(blank_dsn: str) -> None:
     alone could never detect.
     """
     with registry.connect(blank_dsn) as conn:
-        apply_migrations(conn)
+        apply_migrations(conn, target=1)
         with conn.cursor() as cur:
             # Build A applied ITS v2 and recorded it.
             cur.execute("ALTER TABLE runs ADD COLUMN lease_until TIMESTAMPTZ")
@@ -132,7 +100,7 @@ def test_two_shapes_one_number_is_detected(blank_dsn: str) -> None:
             cur.execute("UPDATE schema_meta SET version = 2")
 
     build_b_chain = (
-        *MIGRATIONS,
+        MIGRATIONS[0],
         Migration(version=2, name="data_plane_v2_shape_b", sql="SELECT 'different'"),
     )
     with registry.connect(blank_dsn) as conn:
@@ -149,7 +117,7 @@ def test_unaccounted_v2_history_fails_closed(blank_dsn: str) -> None:
     is exactly the state its migration would have left behind.
     """
     with registry.connect(blank_dsn) as conn:
-        apply_migrations(conn)
+        apply_migrations(conn, target=1)
         with conn.cursor() as cur:
             cur.execute("UPDATE schema_meta SET version = 2")
 
@@ -167,19 +135,19 @@ def test_pre_ledger_database_is_tolerated_and_backfilled(blank_dsn: str) -> None
     them as corruption.
     """
     with registry.connect(blank_dsn) as conn:
-        apply_migrations(conn)
+        apply_migrations(conn, target=1)
         with conn.cursor() as cur:
             cur.execute("DROP TABLE schema_migrations")
 
     with registry.connect(blank_dsn) as conn:
         assert not ledger_exists(conn)
-        assert require_compatible_schema(conn) == LATEST_VERSION  # amnesty
-        assert apply_migrations(conn) == LATEST_VERSION  # no-op apply backfills
+        assert require_compatible_schema(conn) == 1  # amnesty: pre-ledger era only
+        assert apply_migrations(conn, target=1) == 1  # no-op apply backfills
 
     with registry.connect(blank_dsn) as conn:
         assert ledger_exists(conn)
-        verify_ledger(conn, applied_through=LATEST_VERSION)
-        assert require_compatible_schema(conn) == LATEST_VERSION
+        verify_ledger(conn, applied_through=1)
+        assert require_compatible_schema(conn) == 1
 
 
 @pytest.mark.integration

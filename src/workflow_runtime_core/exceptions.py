@@ -28,6 +28,15 @@ class SchemaVersionMismatch(RegistryError):
     """
 
 
+class ActiveAttemptExists(RegistryError):
+    """A workspace already carries a queued/running/paused attempt.
+
+    Enforced by a partial unique index, not by convention: two live attempts on
+    one mutable folder interleave writes into each other's stage outputs, and no
+    application-level care survives a crash at the wrong moment.
+    """
+
+
 class CheckpointerError(WorkflowRuntimeCoreError, RuntimeError):
     """Checkpointer could not be constructed or verified."""
 
