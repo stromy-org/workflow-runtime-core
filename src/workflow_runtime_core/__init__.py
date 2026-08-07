@@ -15,11 +15,12 @@ acquiring LangGraph or aio-pika.
 
 from __future__ import annotations
 
-from .binding import ExecutionBinding
+from .binding import ExecutionBinding, LeaseRenewer
 from .exceptions import (
     ActiveAttemptExists,
     CheckpointerError,
     DependencyError,
+    LeaseLost,
     MigrationChecksumMismatch,
     MigrationError,
     RegistryError,
@@ -68,6 +69,8 @@ __all__: list[str] = [
     "CheckpointerError",
     "DependencyError",
     "ExecutionBinding",
+    "LeaseLost",
+    "LeaseRenewer",
     "Migration",
     "MigrationChecksumMismatch",
     "MigrationError",

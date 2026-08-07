@@ -93,3 +93,22 @@ def test_incomplete_binding_is_rejected() -> None:
         async def resolve_graph(self, workflow: str) -> object: ...
 
     assert not isinstance(_Partial(), workflow_runtime_core.ExecutionBinding)
+
+
+@pytest.mark.contract
+def test_lease_renewer_is_duck_typeable() -> None:
+    """A consumer's renewer couples its transport to the registry lease; the core
+    must accept it structurally rather than by inheritance."""
+
+    class _Renewer:
+        interval_seconds = 30.0
+
+        async def renew(self) -> bool: ...
+
+    assert isinstance(_Renewer(), workflow_runtime_core.LeaseRenewer)
+
+
+@pytest.mark.contract
+def test_lease_surface_is_exported() -> None:
+    for symbol in ("LeaseRenewer", "LeaseLost"):
+        assert symbol in workflow_runtime_core.__all__

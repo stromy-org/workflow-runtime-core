@@ -78,5 +78,40 @@ class ExecutionBinding(Protocol):
         Called only once the graph has genuinely finished (``snapshot.next == ()``).
         A pause is handled by the core and never reaches this method, so an
         implementation does not need to detect interrupts.
+
+        This is also where a consumer publishes its declared exports, because it
+        is the last point before the core commits the terminal transition:
+        publishing here and returning ``artifacts_published=True`` means a run
+        can never be ``completed`` while its outputs are missing. Raising instead
+        leaves the run failed-and-retryable with its workspace intact.
         """
+        ...
+
+
+@runtime_checkable
+class LeaseRenewer(Protocol):
+    """Keeps a claimed run's single-writer lease alive during a long execution.
+
+    Separate from :class:`ExecutionBinding`, and optional, because it is a
+    property of the *transport* rather than of the workflow. A run started by id
+    (the ``--run-id`` lane) has no message to keep invisible and passes none; a
+    run delivered on a queue must renew the registry lease and the message's
+    invisibility **together**. Renewing only one is a silent single-writer
+    violation: extend the invisibility alone and a crash strands the run until an
+    operator notices, extend the registry lease alone and the message redelivers
+    to a second runner while the first is still going.
+
+    Implementations are async because the core renews from inside the same event
+    loop that is driving the graph. A renewal that talks to a blocking driver
+    (psycopg, the Azure SDK) must therefore hand off to a thread — otherwise it
+    stalls the graph it is protecting.
+    """
+
+    #: Seconds between renewal attempts. Must be comfortably shorter than the
+    #: lease itself: the core checks the graph and renews on this cadence, so a
+    #: value close to the lease duration races the expiry it exists to prevent.
+    interval_seconds: float
+
+    async def renew(self) -> bool:
+        """Extend the lease. ``False`` means it was lost and the run must stop."""
         ...

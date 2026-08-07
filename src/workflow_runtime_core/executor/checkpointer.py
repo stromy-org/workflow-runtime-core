@@ -107,6 +107,9 @@ def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
     Job-per-run means one process, one run — so one connection is the right
     shape, and it keeps the per-run connection cost at exactly 1 (the constraint
     that decides when the shared Postgres needs resizing).
+
+    The ``opened`` flag is load-bearing, not defensive (see
+    :func:`acheckpointer` for the failure it prevents).
     """
     enforce_strict_msgpack()
 
@@ -116,14 +119,18 @@ def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
         raise _missing_postgres_saver() from exc
 
     resolved = dsn or dsn_from_env()
+    opened = False
     try:
         with PostgresSaver.from_conn_string(resolved) as saver:
             # Idempotent; creates the checkpoint tables on first use.
             saver.setup()
+            opened = True
             yield saver
     except (CheckpointerError, RegistryError):
         raise
     except Exception as exc:  # noqa: BLE001 - surface any wiring failure loudly
+        if opened:
+            raise
         raise CheckpointerError(f"cannot open the checkpoint store: {exc}") from exc
 
 
@@ -135,6 +142,18 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
     runner runs them via ``ainvoke``, whose async Pregel loop requires a saver
     with async ``aget_tuple`` / ``aput`` methods. One connection per run keeps the
     per-run connection cost at exactly 1.
+
+    **Why the ``opened`` flag.** A generator-based context manager receives the
+    caller's body exception *at the yield*, so a blanket ``except Exception``
+    around the ``async with`` catches failures that have nothing to do with
+    opening anything. Without the flag, every graph error and every stage error
+    inside this block was relabelled "cannot open the checkpoint store: …" —
+    losing the exception's type along with the truth. That mattered most for
+    :class:`~workflow_runtime_core.exceptions.LeaseLost`: rewritten as a
+    ``CheckpointerError``, a lost lease looked like a run failure, and the runner
+    would have written a terminal status over the outcome of whichever runner
+    actually held the lease. Only failures raised *before* the first successful
+    yield are store-open failures.
     """
     enforce_strict_msgpack()
 
@@ -144,14 +163,18 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
         raise _missing_postgres_saver() from exc
 
     resolved = dsn or dsn_from_env()
+    opened = False
     try:
         async with AsyncPostgresSaver.from_conn_string(resolved) as saver:
             # Idempotent; creates the checkpoint tables on first use.
             await saver.setup()
+            opened = True
             yield saver
     except (CheckpointerError, RegistryError):
         raise
     except Exception as exc:  # noqa: BLE001 - surface any wiring failure loudly
+        if opened:
+            raise
         raise CheckpointerError(f"cannot open the checkpoint store: {exc}") from exc
 
 

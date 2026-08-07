@@ -629,11 +629,21 @@ def mark_completed(
 
 
 def mark_failed(conn: DbConnection, run_id: str, error: str) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE runs SET status = %s, error = %s, updated_at = now() WHERE run_id = %s",
-            (RunStatus.FAILED.value, error[:8000], run_id),
+    """Terminal failure with a plain-text reason.
+
+    Clears the lease on v2, exactly as the structured variant does: a failed run
+    that still names a lease owner reads, to every recovery query and every
+    operator, as work someone is still doing.
+    """
+    if _data_plane_live(conn):
+        sql = (
+            "UPDATE runs SET status = %s, error = %s, lease_owner = NULL, "
+            "lease_expires_at = NULL, updated_at = now() WHERE run_id = %s"
         )
+    else:
+        sql = "UPDATE runs SET status = %s, error = %s, updated_at = now() WHERE run_id = %s"
+    with conn.cursor() as cur:
+        cur.execute(sql, (RunStatus.FAILED.value, error[:8000], run_id))
     _emit(conn, run_id, "failed", {"error": error[:2000]})
 
 

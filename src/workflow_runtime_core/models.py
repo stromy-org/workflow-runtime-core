@@ -138,15 +138,24 @@ class TerminalProjection:
     """What an :class:`~workflow_runtime_core.binding.ExecutionBinding` returns
     once its graph reached a terminal snapshot.
 
-    ``outbox`` is empty in Phase A — the transactional outbox lands with schema
-    v2 — but the field exists now so a binding written today keeps its signature
-    when the outbox is switched on.
+    ``outbox`` is still empty: the transactional outbox arrives with the
+    messaging chain (ORG-PLAN-155 Phase B, migration ``0003``), not with the
+    data plane's ``0002``. The field exists now so a binding written today keeps
+    its signature when the outbox is switched on.
     """
 
     status: RunStatus
     artifacts: dict[str, Any] | None = None
     error: str | None = None
     outbox: tuple[Any, ...] = ()
+    #: Whether the binding already published this run's declared exports to
+    #: durable storage. Threaded into ``mark_completed`` so the status flip and
+    #: the publication stamp land in ONE statement: a client that saw
+    #: ``completed`` before the descriptors were written would poll a finished
+    #: run and find nothing to download. Requires schema v2 — the registry
+    #: refuses the stamp on v1 rather than dropping it silently, because a
+    #: dropped stamp lies to the maintenance pass about what is in the container.
+    artifacts_published: bool = False
 
 
 def utcnow() -> datetime:

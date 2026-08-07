@@ -37,6 +37,17 @@ class ActiveAttemptExists(RegistryError):
     """
 
 
+class LeaseLost(WorkflowRuntimeCoreError, RuntimeError):
+    """This runner's single-writer lease expired or was taken over.
+
+    Deliberately NOT a :class:`RegistryError`: nothing went wrong with the
+    registry, and nothing about this run has failed. Another runner has already
+    been told it may claim the run, so the *outcome* now belongs to that process.
+    A runner that sees this must stop and record nothing — writing a terminal
+    status here would overwrite a result this process cannot see.
+    """
+
+
 class CheckpointerError(WorkflowRuntimeCoreError, RuntimeError):
     """Checkpointer could not be constructed or verified."""
 
