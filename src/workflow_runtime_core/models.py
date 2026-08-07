@@ -183,5 +183,29 @@ class TerminalProjection:
     artifacts_published: bool = False
 
 
+@dataclass(frozen=True)
+class RetentionCandidate:
+    """One run the retention pass may delete, with everything cleanup needs.
+
+    Deliberately NOT a :class:`RunRecord`. The retention driver lives outside this
+    package (it is the side that can reach the durable share and the checkpoint
+    store), and handing it a full run would hand it the run's config — a
+    secret-bearing payload it has no use for. These four fields are the whole of
+    what ordered cleanup addresses: the workspace folder, the checkpoint thread,
+    and the row.
+
+    ``client_slug`` and ``workspace_id`` are the two path components of the
+    durable workspace, so a candidate is self-sufficient: the driver never has to
+    re-read the row it is about to delete.
+    """
+
+    run_id: str
+    thread_id: str
+    client_slug: str | None
+    workspace_id: str | None
+    status: RunStatus
+    updated_at: datetime
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)

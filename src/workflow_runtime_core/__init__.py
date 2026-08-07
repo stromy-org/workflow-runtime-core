@@ -24,6 +24,7 @@ from .exceptions import (
     MigrationChecksumMismatch,
     MigrationError,
     RegistryError,
+    RetryNotAllowed,
     SchemaVersionMismatch,
     StageFailure,
     WorkflowRuntimeCoreError,
@@ -42,6 +43,7 @@ from .migrations import (
 from .models import (
     TERMINAL_STATUS_VALUES,
     TERMINAL_STATUSES,
+    RetentionCandidate,
     Run,
     RunRecord,
     RunStatus,
@@ -56,7 +58,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
@@ -76,6 +78,8 @@ __all__: list[str] = [
     "MigrationChecksumMismatch",
     "MigrationError",
     "RegistryError",
+    "RetentionCandidate",
+    "RetryNotAllowed",
     "Run",
     "RunRecord",
     "RunStatus",

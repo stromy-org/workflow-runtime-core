@@ -37,6 +37,23 @@ class ActiveAttemptExists(RegistryError):
     """
 
 
+class RetryNotAllowed(RegistryError):
+    """This run cannot be the parent of a new attempt.
+
+    Distinct from :class:`ActiveAttemptExists`, which is about the *workspace*
+    already being busy. This one is about the run itself: only a ``failed`` run
+    is retryable. A ``completed`` one already produced its outputs, a
+    ``cancelled`` one was stopped deliberately, and a live one has not finished —
+    retrying any of those would mint a second attempt against work that is either
+    fine or still moving.
+
+    A resume is the *other* operation, and the difference is not cosmetic: a
+    resume continues the same LangGraph thread from its checkpoint, while a retry
+    starts a new thread on the same workspace. Offering retry as a way to nudge a
+    paused run would silently abandon its checkpoint.
+    """
+
+
 class StageFailure(WorkflowRuntimeCoreError, RuntimeError):
     """A binding-raised failure that names the pipeline stage it happened in.
 

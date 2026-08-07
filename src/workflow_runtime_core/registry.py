@@ -33,8 +33,19 @@ from typing import Any, NoReturn, cast
 import psycopg
 from psycopg.rows import dict_row
 
-from .exceptions import ActiveAttemptExists, RegistryError, SchemaVersionMismatch
-from .models import TERMINAL_STATUSES, RunRecord, RunStatus, utcnow
+from .exceptions import (
+    ActiveAttemptExists,
+    RegistryError,
+    RetryNotAllowed,
+    SchemaVersionMismatch,
+)
+from .models import (
+    TERMINAL_STATUSES,
+    RetentionCandidate,
+    RunRecord,
+    RunStatus,
+    utcnow,
+)
 
 #: Every connection this module hands out uses ``dict_row``. The alias makes that
 #: a type-level fact, so a consumer writing ``row["status"]`` type-checks.
@@ -263,6 +274,95 @@ def create_run(
         raise
     _emit(conn, resolved_run_id, "created", {"workflow": workflow, "client_slug": client_slug})
     return RunRecord.from_row(row)
+
+
+def create_retry(
+    conn: DbConnection,
+    *,
+    run_id: str,
+    new_run_id: str | None = None,
+    job_template: dict[str, Any] | None = None,
+    image_tag: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> RunRecord:
+    """Mint the next attempt of a failed run: new run, new thread, same workspace.
+
+    The lineage contract in one place, because both consumers need it and both
+    would otherwise write their own version of "what a retry is":
+
+    * **New run id and new thread id.** A retry does not resume the failed
+      LangGraph thread — it starts a clean one. Resuming would replay the failed
+      node's state, which is exactly what a retry is trying to get away from. The
+      new thread defaults to the new run id, so the two never alias.
+    * **Same workspace.** ``workspace_id`` carries over, so whatever completed
+      stages already wrote to the durable folder survives into the new attempt and
+      an expensive run is not recomputed from zero.
+    * **Same input set.** The evidence was verified and attached once; re-attaching
+      would re-run an ownership check that already passed and could now fail for an
+      unrelated reason (an expired session).
+    * **``attempt_no`` from the whole lineage**, not ``parent.attempt_no + 1``.
+      Retrying attempt 2 twice — legitimate, if the first retry also failed —
+      would otherwise mint two attempt 3s and make the audit trail ambiguous.
+
+    The parent's ``idempotency_key`` is deliberately NOT inherited. Reusing it
+    would make ``create_run`` return the parent — the retry would silently become
+    a no-op that reports the failed run back as if it were a new attempt.
+
+    ``config`` overrides the inherited configuration. It exists for the one case
+    that is not a pure rerun: an operator raising a limit or switching a provider
+    pin after diagnosing the failure. Everything about *authorization* still comes
+    from the parent row (owner, workflow), so an override cannot widen scope.
+
+    Concurrency: the parent is locked ``FOR UPDATE`` and the workspace's live-attempt
+    index is the real arbiter. Two operators clicking retry at once produce one new
+    run and one :class:`~workflow_runtime_core.exceptions.ActiveAttemptExists`.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM runs WHERE run_id = %s FOR UPDATE", (run_id,))
+        row = cur.fetchone()
+    if row is None:
+        raise RegistryError(f"run {run_id} not found")
+    parent = RunRecord.from_row(row)
+
+    if parent.status is not RunStatus.FAILED:
+        raise RetryNotAllowed(
+            f"run {run_id} is {parent.status}, and only a failed run can be "
+            "retried. A paused run resumes; a completed one has its results."
+        )
+    if parent.workspace_id is None:
+        # Unreachable on a migrated database (migration 0002 backfills the column
+        # and makes it NOT NULL), so this is the v1 case stated plainly rather
+        # than a KeyError deep in the INSERT.
+        raise SchemaVersionMismatch(
+            f"run {run_id} carries no workspace; retry lineage requires schema "
+            "v2. Run `wrc migrate` first."
+        )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT max(attempt_no) AS highest FROM runs WHERE workspace_id = %s",
+            (parent.workspace_id,),
+        )
+        highest = (cur.fetchone() or {}).get("highest") or parent.attempt_no
+
+    attempt = create_run(
+        conn,
+        workflow=parent.workflow,
+        config=config if config is not None else dict(parent.config_json),
+        client_slug=parent.client_slug,
+        run_id=new_run_id,
+        image_tag=image_tag if image_tag is not None else parent.image_tag,
+        job_template=job_template if job_template is not None else parent.job_template_json,
+        workspace_id=parent.workspace_id,
+        retry_of=parent.run_id,
+        attempt_no=int(highest) + 1,
+        input_set_id=parent.input_set_id,
+    )
+    # Recorded against the PARENT as well, so the failed run's own event trail says
+    # what became of it. An operator reading a failed run should not have to search
+    # for a child to find out whether anyone retried it.
+    _emit(conn, parent.run_id, "retried", {"attempt": attempt.run_id, "attempt_no": attempt.attempt_no})
+    return attempt
 
 
 def find_by_idempotency_key(conn: DbConnection, key: str) -> RunRecord | None:
@@ -724,6 +824,136 @@ def list_events(conn: DbConnection, run_id: str) -> list[dict[str, Any]]:
 
 
 # --- retention ---------------------------------------------------------------
+#
+# Two eligibility rules, and both are lineage rules rather than age rules:
+#
+# 1. **No live attempt on the workspace.** Retention deletes a *workspace*, not
+#    just a row, and a workspace is shared across attempts. A failed attempt 1
+#    whose retry is still running must survive, or the pass would delete the
+#    folder out from under the run that is using it.
+# 2. **No surviving descendant.** ``runs.retry_of`` is a real foreign key with no
+#    cascade, so an ancestor cannot be deleted while a child references it. That
+#    is deliberate — the alternative silently erases audit history — which means
+#    retention has to clear a lineage leaf-first. Candidates come back ordered so
+#    one pass clears a whole chain, and the guard is re-checked at the delete.
+
+# Interpolated into three statements below. It is a module constant with no
+# caller-reachable input, which is why those three carry ``noqa: S608``: the rule
+# cannot distinguish a shared predicate from a spliced value, and duplicating this
+# clause three times to satisfy it would be the actual hazard — three copies of one
+# safety rule, drifting.
+_LINEAGE_SAFE = """
+      AND NOT EXISTS (
+            SELECT 1 FROM runs live
+             WHERE live.workspace_id = r.workspace_id
+               AND live.status <> ALL(%(terminal)s)
+          )
+      AND NOT EXISTS (
+            SELECT 1 FROM runs child WHERE child.retry_of = r.run_id
+          )
+"""
+
+
+def retention_candidates(
+    conn: DbConnection,
+    *,
+    older_than_days: int = 30,
+    limit: int = 200,
+) -> list[RetentionCandidate]:
+    """Runs whose whole lineage is settled and past retention, leaf-first.
+
+    Read-only. The driver that owns the durable share and the checkpoint store
+    performs the ordered cleanup and calls :func:`delete_run` last, so that a
+    failure anywhere in the middle leaves a row the next pass retries rather than
+    an orphaned workspace nobody will ever look for again.
+
+    ``limit`` bounds one pass. A backlog is worked down over successive passes
+    instead of one run holding a long transaction over thousands of rows — and the
+    driver reports what it left, because a silent cap reads as "everything was
+    cleaned".
+    """
+    if older_than_days < 1:
+        raise RegistryError("older_than_days must be at least 1")
+    if not _data_plane_live(conn):
+        # Not a degraded read: on v1 there is no workspace to delete, so ordered
+        # cleanup has nothing to order. Saying so by name is what stops a caller
+        # from concluding "no candidates" and reporting a clean pass.
+        raise SchemaVersionMismatch(
+            "ordered retention requires schema v2 (runs own a durable workspace "
+            "only from the data plane onward); on v1 use prune_terminal_runs."
+        )
+    terminal = [s.value for s in TERMINAL_STATUSES]
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT r.run_id, r.thread_id, r.client_slug, r.workspace_id,
+                   r.status, r.updated_at
+              FROM runs r
+             WHERE r.status = ANY(%(terminal)s)
+               AND r.updated_at < now() - make_interval(days => %(days)s)
+               {_LINEAGE_SAFE}
+             ORDER BY r.workspace_id, r.attempt_no DESC, r.updated_at
+             LIMIT %(limit)s
+            """,  # noqa: S608 - _LINEAGE_SAFE is a constant, never caller input
+            {"terminal": terminal, "days": older_than_days, "limit": limit},
+        )
+        return [
+            RetentionCandidate(
+                run_id=str(row["run_id"]),
+                thread_id=str(row["thread_id"]),
+                client_slug=row["client_slug"],
+                workspace_id=str(row["workspace_id"]) if row["workspace_id"] else None,
+                status=RunStatus(row["status"]),
+                updated_at=row["updated_at"],
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def mark_retention_started(conn: DbConnection, run_id: str) -> None:
+    """Record that ordered cleanup has begun on this run. The audit mark.
+
+    A narrow, named operation rather than a general "write me an event" API: the
+    core owns the event vocabulary, and a consumer free to invent kinds is how two
+    services end up logging the same fact under two names.
+
+    It earns its place by covering the partial-failure case. If the workspace is
+    deleted and the row deletion then fails, the row looks entirely normal — and a
+    retry of it would find an empty folder with nothing to explain why. This event
+    is that explanation, and it is written before anything is destroyed.
+    """
+    _emit(conn, run_id, "retention_started")
+
+
+def delete_run(conn: DbConnection, run_id: str, *, older_than_days: int = 30) -> bool:
+    """Delete ONE run row, re-checking every eligibility rule in the statement.
+
+    The last step of ordered cleanup, and the guard is repeated here rather than
+    trusted from selection time: minutes can pass between the two while a workspace
+    is deleted and checkpoints are pruned, and in that window an operator can retry
+    the very run being reaped. Re-checking in the ``DELETE``'s own ``WHERE`` makes
+    the race impossible to lose — the row simply is not deleted, and ``False`` comes
+    back for the report.
+
+    ``run_events`` cascades. The workspace and the checkpoint thread do not, which
+    is why they are the driver's earlier steps.
+    """
+    terminal = [s.value for s in TERMINAL_STATUSES]
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                f"""
+                DELETE FROM runs r
+                 WHERE r.run_id = %(run_id)s
+                   AND r.status = ANY(%(terminal)s)
+                   AND r.updated_at < now() - make_interval(days => %(days)s)
+                   {_LINEAGE_SAFE}
+                """,  # noqa: S608 - _LINEAGE_SAFE is a constant, never caller input
+                {"run_id": run_id, "terminal": terminal, "days": older_than_days},
+            )
+            return cur.rowcount == 1
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "delete_run")
 
 
 def stale_terminal_thread_ids(
@@ -731,7 +961,14 @@ def stale_terminal_thread_ids(
     *,
     older_than_days: int = 30,
 ) -> list[str]:
-    """Return checkpoint thread IDs whose terminal runs exceeded retention."""
+    """Return checkpoint thread IDs whose terminal runs exceeded retention.
+
+    Kept for the workspace-less lane (a v1 registry, where there is no durable
+    folder to delete and retention is only rows plus checkpoints). The ordered
+    driver built on :func:`retention_candidates` supersedes it wherever a run owns
+    a workspace, because only that path can delete the three artifacts in an order
+    that fails closed.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT thread_id FROM runs WHERE status = ANY(%s) "
@@ -742,17 +979,43 @@ def stale_terminal_thread_ids(
 
 
 def prune_terminal_runs(conn: DbConnection, *, older_than_days: int = 30) -> int:
-    """Delete terminal registry rows past retention, after checkpoint cleanup.
+    """Bulk-delete settled registry rows past retention, after checkpoint cleanup.
 
     The maintenance entrypoint deletes checkpoint data first and calls this only
     once every stale thread has been cleared. Keeping registry deletion separate
     makes a checkpoint failure fail CLOSED: the run row remains available for a
     later retry instead of becoming an orphaned, untraceable checkpoint.
+
+    Lineage-guarded for a concrete reason, not symmetry with the ordered driver:
+    without the guard this statement takes out a failed attempt 1 whose retry is
+    still *running* — deleting the row that names the workspace the live attempt is
+    writing into. And if the surviving descendant is merely newer than the
+    retention window, ``retry_of``'s foreign key aborts the whole statement, so one
+    live lineage stops retention for every unrelated client. The guard turns both
+    into a converging pass: leaves go now, their ancestors on a later one.
+
+    On a v1 registry the guard is not merely unnecessary but unexpressible — there
+    are no lineage columns to read, and no lineages either, since a workspace per
+    attempt is a v2 concept. So v1 keeps the original statement exactly, which is
+    the same expansion-window rule the rest of this module follows.
     """
+    terminal = [s.value for s in TERMINAL_STATUSES]
+    if not _data_plane_live(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM runs WHERE status = ANY(%s) "
+                "AND updated_at < now() - make_interval(days => %s)",
+                (terminal, older_than_days),
+            )
+            return cur.rowcount
     with conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM runs WHERE status = ANY(%s) "
-            "AND updated_at < now() - make_interval(days => %s)",
-            ([s.value for s in TERMINAL_STATUSES], older_than_days),
+            f"""
+            DELETE FROM runs r
+             WHERE r.status = ANY(%(terminal)s)
+               AND r.updated_at < now() - make_interval(days => %(days)s)
+               {_LINEAGE_SAFE}
+            """,  # noqa: S608 - _LINEAGE_SAFE is a constant, never caller input
+            {"terminal": terminal, "days": older_than_days},
         )
         return cur.rowcount
