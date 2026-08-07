@@ -1,6 +1,7 @@
 # Copier answers — DO NOT EDIT BY HAND.
 # Run `uvx copier update --skip-answered` to pull template improvements.
-_src_path: /Users/williammasquelier/Repositories/stromy-org/scaffolds/python-library-template
+_commit: fcc3deb
+_src_path: gh:stromy-org/python-library-template
 author_email: william.masquelier@stromy.com.au
 author_name: William Masquelier
 cli_command_name: wrc
