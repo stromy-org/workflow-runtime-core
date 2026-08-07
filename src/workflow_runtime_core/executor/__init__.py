@@ -9,7 +9,7 @@ acceptance criterion of ORG-PLAN-155, asserted by a dependency audit.
 from __future__ import annotations
 
 from ..binding import LeaseRenewer
-from ..exceptions import LeaseLost
+from ..exceptions import LeaseLost, StageFailure
 from .checkpointer import (
     DURABILITY,
     acheckpointer,
@@ -35,6 +35,7 @@ __all__ = [
     "EXIT_USAGE",
     "LeaseLost",
     "LeaseRenewer",
+    "StageFailure",
     "acheckpointer",
     "bind_checkpointer",
     "checkpointer",

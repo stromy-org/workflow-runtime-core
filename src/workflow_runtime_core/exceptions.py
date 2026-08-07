@@ -37,6 +37,25 @@ class ActiveAttemptExists(RegistryError):
     """
 
 
+class StageFailure(WorkflowRuntimeCoreError, RuntimeError):
+    """A binding-raised failure that names the pipeline stage it happened in.
+
+    The core labels the stages it drives itself (``graph``, ``inputs``,
+    ``context``, ``artifacts``), but a binding often knows a sharper answer: a
+    durable share that is not mounted and an uploaded file that fails its digest
+    both surface while building inputs, and they are not the same incident — one
+    is infrastructure, one is data, and an operator triages them differently.
+    Raise this to say which; the runner records the given ``stage`` verbatim.
+
+    Any exception carrying a ``.stage`` attribute works — this class is just the
+    obvious way to make one.
+    """
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
 class LeaseLost(WorkflowRuntimeCoreError, RuntimeError):
     """This runner's single-writer lease expired or was taken over.
 

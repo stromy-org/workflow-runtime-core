@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from workflow_runtime_core import registry
-from workflow_runtime_core.exceptions import CheckpointerError, LeaseLost
+from workflow_runtime_core.exceptions import CheckpointerError, LeaseLost, StageFailure
 from workflow_runtime_core.executor.checkpointer import acheckpointer
 from workflow_runtime_core.executor.runner import EXIT_CLAIM_LOST, EXIT_FAILED, EXIT_OK, execute
 from workflow_runtime_core.migrations import apply_migrations
@@ -263,6 +263,44 @@ def test_each_stage_records_its_own_label(
     # detail sees the failure without decoding JSON.
     assert after.error == f"{message_prefix}{fail_stage} exploded"
     assert after.lease_owner is None
+
+
+@pytest.mark.integration
+def test_a_binding_may_name_its_own_stage(blank_dsn: str) -> None:
+    """A durable share that is not mounted and a file that fails its digest both
+    surface while building inputs, and they are not the same incident. A binding
+    that knows which one it is says so, and the core records that verbatim."""
+
+    class _Staged(_Binding):
+        async def build_input(self, run: RunRecord) -> Any:
+            raise StageFailure("workspace", "run substrate /mnt/runs is not mounted")
+
+    run = _claimed(blank_dsn)
+    assert execute(run, _Staged(), dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
+    assert after.error_json["stage"] == "workspace"
+    assert after.error_json["message"] == "run substrate /mnt/runs is not mounted"
+
+
+@pytest.mark.integration
+def test_a_bogus_stage_attribute_falls_back_to_the_core_label(blank_dsn: str) -> None:
+    """``.stage`` is read off an arbitrary exception, so a non-string must not
+    reach the JSON column a client-facing surface renders."""
+
+    class _Weird(_Binding):
+        async def build_input(self, run: RunRecord) -> Any:
+            exc = RuntimeError("input exploded")
+            exc.stage = 42  # type: ignore[attr-defined]
+            raise exc
+
+    run = _claimed(blank_dsn)
+    assert execute(run, _Weird(), dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
+    assert after.error_json["stage"] == "inputs"
 
 
 @pytest.mark.integration

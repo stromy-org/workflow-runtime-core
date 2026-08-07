@@ -133,6 +133,16 @@ class _StageError(Exception):
         self.error_type = type(cause).__name__
 
 
+def _declared_stage(exc: BaseException, default: str) -> str:
+    """A binding's own stage label, or the core's default for that call.
+
+    Read defensively: ``.stage`` may be anything on an arbitrary exception, and a
+    non-string would end up in a JSON column that a client-facing surface reads.
+    """
+    declared = getattr(exc, "stage", None)
+    return declared if isinstance(declared, str) and declared else default
+
+
 async def _with_lease_renewal(
     invocation: Awaitable[Any], lease: LeaseRenewer, *, run_id: str
 ) -> Any:
@@ -194,11 +204,13 @@ def execute(
         # uploaded set into the run workspace, say) raises errors already phrased
         # for an operator, and re-wrapping them would bury that text mid-sentence.
         # The STAGE is what the core adds, so a client-facing surface can say
-        # "this run died fetching its inputs" without reading the message at all.
+        # "this run died fetching its inputs" without reading the message at all
+        # — unless the binding named a sharper one (see
+        # :class:`~workflow_runtime_core.exceptions.StageFailure`), which wins.
         try:
             payload = await binding.build_input(run)
         except Exception as exc:
-            raise _StageError("inputs", "", exc) from exc
+            raise _StageError(_declared_stage(exc, "inputs"), "", exc) from exc
 
         # Hosted graphs are async (every real workflow node is ``async def``), so
         # they run through LangGraph's ASYNC Pregel loop: ``ainvoke`` against an
@@ -211,7 +223,7 @@ def execute(
             try:
                 context = await binding.build_context(run)
             except Exception as exc:
-                raise _StageError("context", "", exc) from exc
+                raise _StageError(_declared_stage(exc, "context"), "", exc) from exc
             invocation = cast(
                 "Awaitable[Any]",
                 compiled.ainvoke(  # type: ignore[attr-defined]
@@ -249,7 +261,9 @@ def execute(
                 projection = await binding.project_terminal(run, snapshot)
             except Exception as exc:
                 raise _StageError(
-                    "artifacts", "terminal projection failed: ", exc
+                    _declared_stage(exc, "artifacts"),
+                    "terminal projection failed: ",
+                    exc,
                 ) from exc
             return ("terminal", projection)
 
