@@ -22,7 +22,11 @@ from workflow_runtime_core.exceptions import (
     ActiveAttemptExists,
     SchemaVersionMismatch,
 )
-from workflow_runtime_core.migrations import CORE_NAMESPACE, apply_migrations
+from workflow_runtime_core.migrations import (
+    CORE_NAMESPACE,
+    LATEST_VERSION,
+    apply_migrations,
+)
 from workflow_runtime_core.schema import require_compatible_schema
 
 
@@ -35,27 +39,37 @@ def _migrated(dsn: str, *, target: int | None = None) -> None:
 
 
 @pytest.mark.integration
-def test_fresh_migrate_produces_v2_with_a_full_ledger(blank_dsn: str) -> None:
+def test_fresh_migrate_produces_the_latest_with_a_full_ledger(blank_dsn: str) -> None:
+    """Stated against ``LATEST_VERSION`` rather than a hard-coded number, so
+    adding a migration does not require editing an assertion that was never
+    about *which* version — it is about the ledger being complete and the
+    result being servable."""
     with registry.connect(blank_dsn) as conn:
-        assert apply_migrations(conn) == 2
-        assert require_compatible_schema(conn) == 2
+        assert apply_migrations(conn) == LATEST_VERSION
+        assert require_compatible_schema(conn) == LATEST_VERSION
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT version FROM schema_migrations WHERE namespace = %s "
                 "ORDER BY version",
                 (CORE_NAMESPACE,),
             )
-            assert [r["version"] for r in cur.fetchall()] == [1, 2]
+            versions = [r["version"] for r in cur.fetchall()]
+    assert versions == list(range(1, LATEST_VERSION + 1))
 
 
 @pytest.mark.integration
 def test_v1_to_v2_upgrade_backfills_workspace_from_run_id(blank_dsn: str) -> None:
-    """Every legacy run becomes its own workspace — which it already was."""
+    """Every legacy run becomes its own workspace — which it already was.
+
+    Pinned at ``target=2`` deliberately: this test is about the v1→v2 step, so
+    letting it drift to whatever the latest version happens to be would quietly
+    stop testing the backfill it is named for.
+    """
     _migrated(blank_dsn, target=1)
     with registry.connect(blank_dsn) as conn:
         legacy = registry.create_run(conn, workflow="demo", config={})
     with registry.connect(blank_dsn) as conn:
-        assert apply_migrations(conn) == 2
+        assert apply_migrations(conn, target=2) == 2
     with registry.connect(blank_dsn) as conn:
         upgraded = registry.get_run(conn, legacy.run_id)
     assert upgraded is not None
