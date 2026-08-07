@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workflow-runtime-core"
-version = "0.5.0"
+version = "0.6.0"
 description = "Client-neutral durable workflow lifecycle: versioned run registry, explicit migrations, execution bindings, leases and transactional outbox"
 readme = "README.md"
 requires-python = ">=3.11"
