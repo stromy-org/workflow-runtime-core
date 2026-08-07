@@ -28,6 +28,7 @@ is retained only as a utility for a hypothetical sync-node graph.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import AsyncGenerator, Generator
@@ -51,6 +52,38 @@ _STRICT_MSGPACK_ENV = "LANGGRAPH_STRICT_MSGPACK"
 # committed BEFORE the node's result is acted on — so a process killed mid-step
 # can never lose a step the graph believed it had taken.
 DURABILITY = "sync"
+
+# ``setup()`` is documented as idempotent, and it is — SEQUENTIALLY. Run two of
+# them concurrently against a database with no checkpoint tables and both see
+# "not created", both issue the CREATE, and the loser dies on `duplicate key
+# value violates unique constraint "pg_type_typname_nsp_index"`.
+#
+# Job-per-run starts N runners in parallel by design, so a NEW install's first
+# burst of traffic hits this — and only a new install, which is why it survives
+# every test against a database something already migrated. Observed 2026-08-07
+# on the GMF pilot's first end-to-end run: two messages in, one run completed,
+# one died here.
+#
+# **Why not an advisory lock**, which is how this module's sibling (the registry
+# migrator) serialises its DDL: LangGraph's setup issues `CREATE INDEX
+# CONCURRENTLY`, and CIC waits for every concurrent transaction to finish before
+# it completes. A runner queued on the advisory lock is itself inside a
+# transaction, so the holder waits for the waiters and the waiters wait for the
+# holder — a standstill Postgres does not even report as a deadlock, because
+# CIC's wait is not in the lock graph it checks. Measured, twice: locking on the
+# saver's own connection produced `deadlock detected`, and locking on a
+# dedicated connection hung indefinitely with one session in CIC and seven in
+# `Lock: advisory`.
+#
+# So the race is TOLERATED rather than prevented. The losing side's error is
+# always "the thing I was creating already exists", and re-running setup against
+# that state is a no-op, so a bounded retry converges — and nothing ever blocks,
+# which is what keeps CIC able to finish.
+SETUP_MAX_ATTEMPTS = 6
+
+#: Base backoff between setup retries. Small: the winner only has to finish its
+#: DDL, not do real work.
+SETUP_RETRY_BASE_SECONDS = 0.25
 
 
 def enforce_strict_msgpack() -> None:
@@ -92,6 +125,60 @@ def _force_strict_flag_on_loaded_module() -> None:
         setattr(mod, "STRICT_MSGPACK_ENABLED", True)  # noqa: B010 - module attr, not a known field
 
 
+def _is_concurrent_setup_race(exc: BaseException) -> bool:
+    """Is this "someone else created it first", rather than a real failure?
+
+    Matched on SQLSTATE, not message text: the messages are localised by the
+    server's lc_messages, so a text match silently stops working on a
+    non-English database and turns a survivable race back into a dead run.
+
+    * 23505 unique_violation — the duplicate ``pg_type`` row, the observed one.
+    * 42P07 duplicate_table / 42710 duplicate_object — the same race caught at a
+      different point in the DDL.
+    * 40P01 deadlock_detected — two setups interleaving catalog work.
+    """
+    import psycopg
+
+    if not isinstance(exc, psycopg.Error):
+        return False
+    return getattr(exc, "sqlstate", None) in {"23505", "42P07", "42710", "40P01"}
+
+
+def _setup_retry_delay(attempt: int) -> float:
+    """Backoff with jitter, so N racing runners do not retry in lockstep."""
+    import random
+
+    return SETUP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random())  # noqa: S311 - jitter, not cryptography
+
+
+def _setup_tolerating_races(saver: PostgresSaver) -> None:
+    """Run ``setup()``, retrying only the concurrent-first-use race."""
+    import time
+
+    for attempt in range(1, SETUP_MAX_ATTEMPTS + 1):
+        try:
+            saver.setup()
+        except Exception as exc:
+            if attempt == SETUP_MAX_ATTEMPTS or not _is_concurrent_setup_race(exc):
+                raise
+            time.sleep(_setup_retry_delay(attempt))
+        else:
+            return
+
+
+async def _asetup_tolerating_races(saver: AsyncPostgresSaver) -> None:
+    """Async twin of :func:`_setup_tolerating_races`."""
+    for attempt in range(1, SETUP_MAX_ATTEMPTS + 1):
+        try:
+            await saver.setup()
+        except Exception as exc:
+            if attempt == SETUP_MAX_ATTEMPTS or not _is_concurrent_setup_race(exc):
+                raise
+            await asyncio.sleep(_setup_retry_delay(attempt))
+        else:
+            return
+
+
 def _missing_postgres_saver() -> CheckpointerError:
     return CheckpointerError(
         "langgraph-checkpoint-postgres is not installed; the hosted runtime "
@@ -122,8 +209,7 @@ def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
     opened = False
     try:
         with PostgresSaver.from_conn_string(resolved) as saver:
-            # Idempotent; creates the checkpoint tables on first use.
-            saver.setup()
+            _setup_tolerating_races(saver)
             opened = True
             yield saver
     except (CheckpointerError, RegistryError):
@@ -166,8 +252,7 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
     opened = False
     try:
         async with AsyncPostgresSaver.from_conn_string(resolved) as saver:
-            # Idempotent; creates the checkpoint tables on first use.
-            await saver.setup()
+            await _asetup_tolerating_races(saver)
             opened = True
             yield saver
     except (CheckpointerError, RegistryError):
