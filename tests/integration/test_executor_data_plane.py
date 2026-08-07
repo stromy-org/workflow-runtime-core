@@ -37,19 +37,39 @@ class _FakeGraph:
 
     ``bind_checkpointer`` shallow-copies whatever it is given, so the mutable
     ``observed`` dict is shared with the copy that actually runs — which is how a
-    cancellation raised inside ``ainvoke`` is visible to the assertions.
+    cancellation raised inside the stream is visible to the assertions.
+
+    ``astream``, not ``ainvoke``: the runner drives graphs by streaming so node
+    completions become durable progress, and ``updates`` mode is the shape it
+    consumes — one chunk per finished node, plus LangGraph's own ``__interrupt__``
+    chunk when the graph pauses. Verified against langgraph 1.x before this fake
+    was written to match it.
     """
 
     context_schema = None
 
-    def __init__(self, *, sleep: float = 0.0, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        sleep: float = 0.0,
+        raises: Exception | None = None,
+        raise_after_chunks: bool = False,
+        chunks: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.sleep = sleep
         self.raises = raises
+        self.raise_after_chunks = raise_after_chunks
+        self.chunks = chunks if chunks is not None else [{"analyse": {"ok": True}}]
         self.checkpointer: Any = None
         self.observed: dict[str, Any] = {"cancelled": False, "invoked": False}
 
-    async def ainvoke(self, payload: Any, **kwargs: Any) -> dict[str, Any]:
+    async def astream(self, payload: Any, **kwargs: Any) -> Any:
         self.observed["invoked"] = True
+        self.observed["stream_mode"] = kwargs.get("stream_mode")
+        if self.raises is not None and not self.raise_after_chunks:
+            raise self.raises
+        for chunk in self.chunks:
+            yield chunk
         if self.raises is not None:
             raise self.raises
         if self.sleep:
@@ -58,7 +78,6 @@ class _FakeGraph:
             except asyncio.CancelledError:
                 self.observed["cancelled"] = True
                 raise
-        return {"artifacts": {"report": "ok"}}
 
     async def aget_state(self, config: Any) -> Any:
         return type("_Snapshot", (), {"values": {"artifacts": {"report": "ok"}}, "next": ()})()
@@ -155,7 +174,11 @@ def test_a_lost_lease_stops_the_graph_and_records_nothing(blank_dsn: str) -> Non
     """The run stays ``running``: whichever runner holds the lease now will write
     the outcome, and a terminal status written here would overwrite it."""
     run = _claimed(blank_dsn)
-    graph = _FakeGraph(sleep=10)
+    # No chunks: the graph goes straight to its long await, so the cancellation is
+    # observed at a deterministic point. With a chunk first, the cancel can land
+    # inside the progress write instead — harmless, but it makes this assertion
+    # about lease loss into a race with telemetry.
+    graph = _FakeGraph(sleep=10, chunks=[])
     binding = _Binding(graph)
 
     assert execute(run, binding, dsn=blank_dsn, lease=_Renewer(grants=1)) == EXIT_CLAIM_LOST
@@ -340,7 +363,112 @@ def test_on_v1_a_completion_still_lands(blank_dsn: str) -> None:
     assert _row(blank_dsn, run.run_id).status is RunStatus.COMPLETED
 
 
-# --- 4. the checkpointer's error boundary -------------------------------------
+# --- 4. progress comes off the graph's own stream -----------------------------
+
+
+@pytest.mark.integration
+def test_progress_lands_on_the_row_as_nodes_finish(blank_dsn: str) -> None:
+    """The difference between a client seeing ``running`` for four hours and seeing
+    which stage it is on. ``interval=0`` admits every event; the rate limit itself is
+    unit-tested."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(chunks=[{"gather": {}}, {"analyse": {}}, {"render": {}}])
+
+    assert execute(
+        run, _Binding(graph), dsn=blank_dsn, progress_interval_seconds=0
+    ) == EXIT_OK
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.progress_json is not None
+    assert after.progress_json["node"] == "render"
+    assert after.progress_json["nodes_completed"] == 3
+    # The heartbeat rides the same write, so "is it alive" needs no second column.
+    assert after.heartbeat_at is not None
+
+
+@pytest.mark.integration
+def test_the_graph_is_streamed_in_updates_mode(blank_dsn: str) -> None:
+    """Pinned deliberately: ``values`` mode would ship the entire accumulated state
+    on every superstep — the client's own content, over the wire, per step — to
+    produce the same node names ``updates`` gives for a delta."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph()
+    execute(run, _Binding(graph), dsn=blank_dsn)
+    assert graph.observed["stream_mode"] == "updates"
+
+
+@pytest.mark.integration
+def test_a_pause_keeps_the_progress_it_reached(blank_dsn: str) -> None:
+    """A paused run is the case a client is most likely to be looking at — it is
+    waiting for that client. It must still say how far it got."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(
+        chunks=[{"gather": {}}, {"__interrupt__": ({"ask": "confirm weights"},)}]
+    )
+
+    assert execute(
+        run, _Binding(graph), dsn=blank_dsn, progress_interval_seconds=0
+    ) == EXIT_OK
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.status is RunStatus.PAUSED
+    assert after.interrupt_payload == {"ask": "confirm weights"}
+    assert after.progress_json is not None
+    # One node, not two: the interrupt is its own chunk and is not a completion.
+    assert after.progress_json["nodes_completed"] == 1
+    assert after.progress_json["node"] == "gather"
+
+
+@pytest.mark.integration
+def test_a_failed_run_records_the_node_it_died_after(blank_dsn: str) -> None:
+    """``error_json.stage`` says "graph"; only the progress row says *which node*.
+    Flushing on the failure path is what makes that recoverable from the registry
+    rather than only from container logs."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(
+        chunks=[{"gather": {}}, {"analyse": {}}],
+        raises=ValueError("render blew up"),
+        raise_after_chunks=True,
+    )
+
+    assert execute(run, _Binding(graph), dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.status is RunStatus.FAILED
+    assert after.progress_json is not None
+    assert after.progress_json["node"] == "analyse"
+    assert after.progress_json["nodes_completed"] == 2
+
+
+@pytest.mark.integration
+def test_a_lost_lease_records_no_progress_either(blank_dsn: str) -> None:
+    """The rule against writing after a lost lease has no telemetry exemption: the
+    row belongs to the replacement runner from that moment."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(sleep=10, chunks=[])
+    assert execute(
+        run, _Binding(graph), dsn=blank_dsn, lease=_Renewer(grants=1)
+    ) == EXIT_CLAIM_LOST
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.progress_json is None
+
+
+@pytest.mark.integration
+def test_on_v1_progress_is_skipped_and_the_run_still_completes(blank_dsn: str) -> None:
+    """``progress_json`` does not exist on v1. Telemetry that cannot be stored must
+    not turn a healthy run into a failure — the whole expansion window depends on
+    this build running unchanged against the shared registry."""
+    run = _claimed(blank_dsn, target=1)
+    graph = _FakeGraph(chunks=[{"gather": {}}, {"analyse": {}}])
+
+    assert execute(
+        run, _Binding(graph), dsn=blank_dsn, progress_interval_seconds=0
+    ) == EXIT_OK
+    assert _row(blank_dsn, run.run_id).status is RunStatus.COMPLETED
+
+
+# --- 5. the checkpointer's error boundary -------------------------------------
 
 
 @pytest.mark.integration
