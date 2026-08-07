@@ -136,6 +136,85 @@ def claim_due(
         return [DeliveryReceipt.from_row(row) for row in cur.fetchall()]
 
 
+def get_receipt(
+    conn: DbConnection, *, service_namespace: str, destination: str, message_id: str
+) -> DeliveryReceipt | None:
+    """Read one receipt. The caller of :func:`claim` uses this to learn WHY."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM delivery_receipts
+             WHERE service_namespace = %s AND destination = %s AND message_id = %s
+            """,
+            (service_namespace, destination, message_id),
+        )
+        row = cur.fetchone()
+    return None if row is None else DeliveryReceipt.from_row(row)
+
+
+def claim(
+    conn: DbConnection,
+    *,
+    service_namespace: str,
+    destination: str,
+    message_id: str,
+    owner: str,
+    lease_seconds: int,
+) -> DeliveryReceipt | None:
+    """Claim ONE receipt by identity, for a consumer the broker pushes to.
+
+    This is the duplicate-suppression seam. A push-based consumer holds the
+    message in its hand and cannot choose which row to work on, so
+    :func:`claim_due` — which picks whatever is due — cannot express it: it
+    would claim rows whose payload the caller does not have and strand them
+    under a lease until reconciliation wrongly called them ``uncertain``.
+
+    ``None`` means "do not send", and the four reasons are all correct outcomes:
+
+    * ``delivered`` — this is a redelivery of the at-least-once outbound queue.
+      Refusing it here is precisely what stops a real person receiving a second
+      copy. Nothing else in the pipeline can make that call, because nothing
+      else knows the provider already accepted it.
+    * ``uncertain`` — a human owns this now (see the module docstring).
+    * ``sending`` — another consumer holds a live lease on it.
+    * absent — the caller skipped :func:`open_receipt`.
+
+    Call :func:`get_receipt` to tell those apart; ``delivered``/``uncertain``
+    mean acknowledge the delivery, the other two mean leave it alone.
+
+    Unlike :func:`claim_due` this deliberately IGNORES ``next_attempt_at``. On a
+    push path the broker is already the retry scheduler — it decided this
+    delivery was due — and honouring the row's backoff as well would leave two
+    schedulers disagreeing about one message: the consumer would refuse the
+    delivery it was just handed, ack nothing, and spin. The row's ``attempts``
+    and backoff stay meaningful for the pull path and for operators; on the push
+    path the queue's ``x-delivery-limit`` is what bounds the retries.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE delivery_receipts
+               SET status = 'sending',
+                   attempts = attempts + 1,
+                   lease_owner = %s,
+                   lease_expires_at = now() + make_interval(secs => %s),
+                   updated_at = now()
+             WHERE service_namespace = %s AND destination = %s AND message_id = %s
+               AND (
+                     status IN ('pending', 'failed')
+                     -- A lease that has lapsed is reclaimable in the same
+                     -- statement, so a consumer that died mid-send does not
+                     -- block the redelivery behind a reconciliation pass.
+                     OR (status = 'sending' AND lease_expires_at < now())
+                   )
+            RETURNING *
+            """,
+            (owner, lease_seconds, service_namespace, destination, message_id),
+        )
+        row = cur.fetchone()
+    return None if row is None else DeliveryReceipt.from_row(row)
+
+
 def _settle(
     conn: DbConnection,
     *,
