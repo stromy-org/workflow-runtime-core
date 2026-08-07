@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workflow-runtime-core"
-version = "0.4.0"
+version = "0.5.0"
 description = "Client-neutral durable workflow lifecycle: versioned run registry, explicit migrations, execution bindings, leases and transactional outbox"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,10 +37,13 @@ rabbitmq = [
     "aio-pika>=9.4,<10",
 ]
 # Fault-injection + real-broker/database fixtures for consumers reusing our harness.
+# RabbitMQ is in here, not just postgres: the delivery guarantees (unroutable
+# returns, redelivery of an unacknowledged message) are statements about the
+# BROKER, and a fake proves only that the fake matches our belief about it.
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "testcontainers[postgres]>=4.8.0",
+    "testcontainers[postgres,rabbitmq]>=4.8.0",
 ]
 all = ["workflow-runtime-core[executor,rabbitmq,test]"]
 

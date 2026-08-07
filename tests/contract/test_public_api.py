@@ -66,6 +66,12 @@ def test_base_import_does_not_pull_langgraph_or_aio_pika() -> None:
         "import workflow_runtime_core.migrations;"
         "import workflow_runtime_core.schema;"
         "import workflow_runtime_core.binding;"
+        # messaging is BASE install: ingress, outbox and receipt logic are pure
+        # DML, and only the broker transport needs aio-pika. That split is the
+        # reason the workflow facade can consume this package without acquiring
+        # a broker client, so it is asserted rather than assumed.
+        "import workflow_runtime_core.messaging;"
+        "import workflow_runtime_core.messaging.egress;"
         "leaked=[m for m in sys.modules if m.split('.')[0] in {'langgraph','aio_pika'}];"
         "print(','.join(sorted(leaked)))"
     )
