@@ -139,7 +139,7 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
     """Yield a set-up ``AsyncPostgresSaver`` bound to one shared connection.
 
     The runtime path (see module docstring): hosted graphs are async, so the
-    runner runs them via ``ainvoke``, whose async Pregel loop requires a saver
+    runner drives them via ``astream``, whose async Pregel loop requires a saver
     with async ``aget_tuple`` / ``aput`` methods. One connection per run keeps the
     per-run connection cost at exactly 1.
 

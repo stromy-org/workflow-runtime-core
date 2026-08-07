@@ -28,13 +28,20 @@ NS = "gmf-pilot"
 
 
 class _Graph:
+    """Stand-in compiled graph.
+
+    ``astream`` in ``updates`` mode — one chunk per finished node — because that
+    is how the runner drives graphs, so node completions can become durable
+    progress.
+    """
+
     context_schema = None
 
     def __init__(self) -> None:
         self.checkpointer: Any = None
 
-    async def ainvoke(self, payload: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"artifacts": {"report": "ok"}}
+    async def astream(self, payload: Any, **kwargs: Any) -> Any:
+        yield {"analyse": {"ok": True}}
 
     async def aget_state(self, config: Any) -> Any:
         return type("_Snapshot", (), {"values": {}, "next": ()})()

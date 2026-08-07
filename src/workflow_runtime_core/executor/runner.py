@@ -16,6 +16,14 @@ run id. That is load-bearing security, not tidiness: starting a hosted job grant
 the caller access to every secret configured on it, so caller-controlled values
 must never reach the job template. The run id is an opaque UUID minted by us.
 
+Progress (schema v2)
+--------------------
+The graph is driven with ``astream``, not ``ainvoke``, so every node completion
+becomes a durable, rate-limited progress snapshot on the run row — the difference
+between a client seeing ``running`` for four hours and seeing which stage it is on.
+See :mod:`workflow_runtime_core.executor.progress`; it degrades on its own against
+a v1 registry, so this path is identical inside the expansion window.
+
 Lease ownership (schema v2)
 ---------------------------
 ``execute`` optionally takes a :class:`~workflow_runtime_core.binding.LeaseRenewer`.
@@ -44,9 +52,10 @@ from .. import registry, schema
 from ..exceptions import LeaseLost, SchemaVersionMismatch
 from ..models import TERMINAL_STATUSES, RunRecord, RunStatus, TerminalProjection
 from .checkpointer import DURABILITY, acheckpointer, bind_checkpointer
+from .progress import DEFAULT_PROGRESS_INTERVAL_SECONDS, ProgressRecorder
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Awaitable
+    from collections.abc import AsyncIterator, Awaitable
 
     from ..binding import ExecutionBinding, LeaseRenewer
 
@@ -181,6 +190,7 @@ def execute(
     *,
     dsn: str | None = None,
     lease: LeaseRenewer | None = None,
+    progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
 ) -> int:
     """Execute an already-claimed run to a terminal or paused state.
 
@@ -188,11 +198,19 @@ def execute(
     for the duration (a queue message). Losing the lease returns
     ``EXIT_CLAIM_LOST`` and records nothing: the replacement runner owns the
     outcome from that moment.
+
+    ``progress_interval_seconds`` throttles durable progress writes. It is not a
+    feature switch: progress is always consumed, because a run that reports nothing
+    for hours is indistinguishable from a wedged one, and a registry that cannot
+    store it degrades on its own (see :mod:`.progress`).
     """
     config = dict(run.config_json)
     config.pop(registry.RESUME_KEY, None)
 
     invoke_config = {"configurable": {"thread_id": run.thread_id, **config}}
+    recorder = ProgressRecorder(
+        run.run_id, dsn=dsn, min_interval_seconds=progress_interval_seconds
+    )
 
     async def _drive() -> tuple[str, Any]:
         try:
@@ -213,10 +231,10 @@ def execute(
             raise _StageError(_declared_stage(exc, "inputs"), "", exc) from exc
 
         # Hosted graphs are async (every real workflow node is ``async def``), so
-        # they run through LangGraph's ASYNC Pregel loop: ``ainvoke`` against an
-        # async-capable saver. A sync ``.invoke()`` raises "No synchronous
-        # function provided" on the first async node, and a sync ``PostgresSaver``
-        # has no async methods for the async loop to call. ``ainvoke`` is a strict
+        # they run through LangGraph's ASYNC Pregel loop: ``astream`` against an
+        # async-capable saver. A sync ``.stream()`` raises "No synchronous function
+        # provided" on the first async node, and a sync ``PostgresSaver`` has no
+        # async methods for the async loop to call. The async path is a strict
         # superset — it also runs any sync-node graph.
         async with acheckpointer(dsn) as saver:
             compiled = bind_checkpointer(graph, saver)
@@ -224,22 +242,61 @@ def execute(
                 context = await binding.build_context(run)
             except Exception as exc:
                 raise _StageError(_declared_stage(exc, "context"), "", exc) from exc
-            invocation = cast(
-                "Awaitable[Any]",
-                compiled.ainvoke(  # type: ignore[attr-defined]
-                    payload,
-                    config=invoke_config,
-                    context=context,
-                    durability=DURABILITY,
-                ),
-            )
-            final_state: Any = (
-                await invocation
-                if lease is None
-                else await _with_lease_renewal(invocation, lease, run_id=run.run_id)
-            )
+            # STREAMED, not invoked, so node completions become durable progress
+            # as they happen (see :mod:`.progress`). ``updates`` mode is what makes
+            # that affordable: each chunk is the delta of the node that just
+            # finished, where ``values`` mode would ship the entire accumulated
+            # state on every superstep. Nothing is given up by not collecting a
+            # return value — the terminal path already reads the durable snapshot
+            # back rather than projecting from the emitted state.
+            async def _consume() -> Any:
+                paused_at: Any = None
+                stream = cast(
+                    "AsyncIterator[dict[str, Any]]",
+                    compiled.astream(  # type: ignore[attr-defined]
+                        payload,
+                        config=invoke_config,
+                        context=context,
+                        durability=DURABILITY,
+                        stream_mode="updates",
+                    ),
+                )
+                async for chunk in stream:
+                    found = extract_interrupt(chunk)
+                    if found is not None:
+                        # Keep draining: the interrupt is announced in its own
+                        # chunk, and a parallel branch may still have updates
+                        # behind it that belong in the progress count.
+                        paused_at = found
+                        continue
+                    await recorder.observe(chunk)
+                return paused_at
 
-            interrupt_payload = extract_interrupt(final_state)
+            invocation = cast("Awaitable[Any]", _consume())
+            try:
+                interrupt_payload: Any = (
+                    await invocation
+                    if lease is None
+                    else await _with_lease_renewal(invocation, lease, run_id=run.run_id)
+                )
+            except LeaseLost:
+                # Deliberately no flush: this process no longer owns the row, and
+                # the rule against writing after a lost lease has no telemetry
+                # exemption. A progress write already in flight when the lease
+                # dropped can still land — ``asyncio.to_thread`` cannot recall a
+                # running thread — and that is tolerable where a terminal status
+                # would not be: no lifecycle decision reads ``progress_json`` or
+                # ``heartbeat_at``, so a late one is stale information, not a
+                # contradicted outcome.
+                raise
+            except Exception:
+                # A failure still gets its last snapshot, so "died at node X" is
+                # recoverable from the row rather than only from the logs.
+                with contextlib.suppress(Exception):
+                    await recorder.flush()
+                raise
+            await recorder.flush()
+
             if interrupt_payload is not None:
                 return ("paused", interrupt_payload)
 

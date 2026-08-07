@@ -43,6 +43,11 @@ def test_lifecycle_surface_is_exported() -> None:
         "SchemaVersionMismatch",
         "require_compatible_schema",
         "apply_migrations",
+        # WS5: retry lineage and ordered retention are part of the shared surface
+        # for the same reason the rest is — both consumers need them, and a second
+        # implementation of "what a retry is" is how the schema forked.
+        "RetryNotAllowed",
+        "RetentionCandidate",
     ):
         assert symbol in workflow_runtime_core.__all__
 
