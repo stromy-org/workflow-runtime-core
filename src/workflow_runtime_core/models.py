@@ -38,9 +38,11 @@ TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
 class RunRecord:
     """One hosted run. Mirrors a ``runs`` row.
 
-    Schema v2 adds recovery columns (lease, attempt, execution reference). They
-    are deliberately absent here in v1 and will arrive as defaulted optional
-    fields so that a v1 reader keeps constructing this record unchanged.
+    The v2 data-plane fields (workspace/attempt lineage, dispatch lease,
+    progress) are defaulted optionals read through ``.get``: this same reader
+    runs against a v1 database during the expansion window, where none of those
+    columns exist. Column names follow the 2026-08-06 fork resolution —
+    ``lease_expires_at``, ``attempt_no``/``retry_of`` — one shape, one number.
     """
 
     run_id: str
@@ -57,9 +59,26 @@ class RunRecord:
     error: str | None
     artifacts_json: dict[str, Any] | None
     idempotency_key: str | None
+    # --- v2: workflow data plane (ORG-PLAN-164) ------------------------------
+    workspace_id: str | None = None
+    retry_of: str | None = None
+    attempt_no: int = 1
+    dispatch_id: str | None = None
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    progress_json: dict[str, Any] | None = None
+    error_json: dict[str, Any] | None = None
+    delivery_count: int = 0
+    artifacts_published_at: datetime | None = None
+    input_set_id: str | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> RunRecord:
+        def _uuid(name: str) -> str | None:
+            value = row.get(name)
+            return str(value) if value is not None else None
+
         return cls(
             run_id=str(row["run_id"]),
             workflow=row["workflow"],
@@ -75,6 +94,18 @@ class RunRecord:
             error=row["error"],
             artifacts_json=row["artifacts_json"],
             idempotency_key=row["idempotency_key"],
+            workspace_id=_uuid("workspace_id"),
+            retry_of=_uuid("retry_of"),
+            attempt_no=row.get("attempt_no") or 1,
+            dispatch_id=_uuid("dispatch_id"),
+            lease_owner=row.get("lease_owner"),
+            lease_expires_at=row.get("lease_expires_at"),
+            heartbeat_at=row.get("heartbeat_at"),
+            progress_json=row.get("progress_json"),
+            error_json=row.get("error_json"),
+            delivery_count=row.get("delivery_count") or 0,
+            artifacts_published_at=row.get("artifacts_published_at"),
+            input_set_id=_uuid("input_set_id"),
         )
 
     def public(self) -> dict[str, Any]:

@@ -148,8 +148,61 @@ class Migration:
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
 
 
+# v2 (ORG-PLAN-164 / 2026-08-06 fork resolution): the workflow data plane —
+# workspace/attempt lineage, dispatch leases, and central progress. Purely
+# additive; every new column is nullable or defaulted, so a v1-compiled reader
+# keeps working against a v2 database. That is what makes the
+# expand/migrate/cutover/contract order safe.
+#
+# Column names are the RECONCILED shape: ``lease_expires_at`` (ORG-PLAN-155's
+# name), ``attempt_no``/``retry_of``/``workspace_id`` (ORG-PLAN-164's lineage —
+# a per-attempt record, not a counter). ORG-PLAN-155's messaging tables land as
+# 0003, and the workflow facade's upload-session tables live in its own
+# app-owned ledger namespace, per the ownership rule: this chain carries only
+# what THIS library reads and writes.
+#
+# workspace_id backfills to run_id: every legacy run becomes its own workspace,
+# which is exactly what it already was (one ephemeral folder per run). That lets
+# the column be NOT NULL from the start rather than carrying a nullable column
+# forever with an "is it set yet" branch at every read.
+_V2_DDL = """
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS workspace_id     UUID;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS retry_of         UUID REFERENCES runs (run_id);
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS attempt_no       INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS dispatch_id      UUID;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS lease_owner      TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS heartbeat_at     TIMESTAMPTZ;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress_json    JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS error_json       JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS delivery_count   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS artifacts_published_at TIMESTAMPTZ;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_set_id     UUID;
+
+UPDATE runs SET workspace_id = run_id WHERE workspace_id IS NULL;
+ALTER TABLE runs ALTER COLUMN workspace_id SET NOT NULL;
+
+-- At most ONE non-terminal attempt per workspace. This is the constraint that
+-- makes retry safe: two live attempts sharing a mutable folder would interleave
+-- writes into each other's stage outputs, and no amount of application-level
+-- care survives a crash at the wrong moment.
+CREATE UNIQUE INDEX IF NOT EXISTS runs_active_workspace_uniq
+    ON runs (workspace_id)
+    WHERE status IN ('queued', 'running', 'paused');
+
+-- A dispatch id identifies one enqueue attempt. Redelivery of the same message
+-- must not be able to start a second writer, so the claim checks it.
+CREATE INDEX IF NOT EXISTS runs_dispatch_id_idx ON runs (dispatch_id)
+    WHERE dispatch_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS runs_lease_expires_at_idx ON runs (lease_expires_at)
+    WHERE lease_expires_at IS NOT NULL;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="run_registry_v1", sql=_V1_DDL),
+    Migration(version=2, name="workflow_data_plane_v2", sql=_V2_DDL),
 )
 
 #: Highest version this build knows how to apply.

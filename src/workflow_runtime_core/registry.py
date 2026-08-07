@@ -28,13 +28,13 @@ import os
 import uuid
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import psycopg
 from psycopg.rows import dict_row
 
-from .exceptions import RegistryError
-from .models import TERMINAL_STATUSES, RunRecord, RunStatus
+from .exceptions import ActiveAttemptExists, RegistryError, SchemaVersionMismatch
+from .models import TERMINAL_STATUSES, RunRecord, RunStatus, utcnow
 
 #: Every connection this module hands out uses ``dict_row``. The alias makes that
 #: a type-level fact, so a consumer writing ``row["status"]`` type-checks.
@@ -112,6 +112,32 @@ def new_run_id() -> str:
     return str(uuid.uuid4())
 
 
+def _data_plane_live(conn: DbConnection) -> bool:
+    """Whether the live schema carries the v2 data-plane columns.
+
+    Probed per call, not cached: terminal writes and run creation are rare
+    relative to their round trips, and a cached answer would go stale across the
+    one moment it matters — the migration itself.
+    """
+    from .schema import read_schema_version
+
+    live = read_schema_version(conn)
+    return live is not None and live >= 2
+
+
+def _require_data_plane_column(exc: psycopg.errors.UndefinedColumn, feature: str) -> NoReturn:
+    """Turn a raw UndefinedColumn into the named error the caller can act on.
+
+    Without this, a v2-only call against a v1 database surfaces as a cryptic
+    column error in a background worker AFTER the startup gate went green —
+    exactly the silent-collision shape the 2026-08-06 fork analysis documented.
+    """
+    raise SchemaVersionMismatch(
+        f"{feature} requires schema v2 (the workflow data plane); the live "
+        "registry is still v1. Run `wrc migrate` before enabling this path."
+    ) from exc
+
+
 # --- accessors ---------------------------------------------------------------
 
 
@@ -126,17 +152,39 @@ def create_run(
     image_tag: str | None = None,
     job_template: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
+    workspace_id: str | None = None,
+    retry_of: str | None = None,
+    attempt_no: int = 1,
+    input_set_id: str | None = None,
 ) -> RunRecord:
     """Register a queued run. Returns the EXISTING run on idempotency-key reuse.
 
     ``run_id`` may be supplied by a caller that must know the id before the row
     exists (the facade mints one to render its job template). It stays optional
     so the Stromy path keeps its original signature.
+
+    The v2 lineage arguments: a fresh run owns a brand-new workspace; a retry
+    passes the prior one in so completed stage outputs survive into the new
+    attempt. On a v1 database they must be left at their defaults — passing any
+    of them raises the named schema error rather than silently dropping lineage.
     """
     if idempotency_key:
         existing = find_by_idempotency_key(conn, idempotency_key)
         if existing is not None:
             return existing
+
+    data_plane = _data_plane_live(conn)
+    lineage_requested = (
+        workspace_id is not None
+        or retry_of is not None
+        or attempt_no != 1
+        or input_set_id is not None
+    )
+    if lineage_requested and not data_plane:
+        raise SchemaVersionMismatch(
+            "workspace/attempt lineage requires schema v2; the live registry is "
+            "still v1. Run `wrc migrate` before creating lineage-bearing runs."
+        )
 
     resolved_run_id = run_id or new_run_id()
     try:
@@ -147,34 +195,71 @@ def create_run(
         # statement, leaving the caller's outer transaction usable for the
         # re-fetch below (a bare INSERT would poison the whole transaction).
         with conn.transaction(), conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO runs (run_id, workflow, thread_id, status, client_slug,
-                                  config_json, image_tag, job_template_json,
-                                  idempotency_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-                """,
-                (
-                    resolved_run_id,
-                    workflow,
-                    thread_id or resolved_run_id,  # one thread per run unless resuming
-                    RunStatus.QUEUED.value,
-                    client_slug,
-                    json.dumps(config),
-                    image_tag,
-                    json.dumps(job_template) if job_template is not None else None,
-                    idempotency_key,
-                ),
-            )
+            if data_plane:
+                cur.execute(
+                    """
+                    INSERT INTO runs (run_id, workflow, thread_id, status,
+                                      client_slug, config_json, image_tag,
+                                      job_template_json, idempotency_key,
+                                      workspace_id, retry_of, attempt_no,
+                                      input_set_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        resolved_run_id,
+                        workflow,
+                        thread_id or resolved_run_id,
+                        RunStatus.QUEUED.value,
+                        client_slug,
+                        json.dumps(config),
+                        image_tag,
+                        json.dumps(job_template) if job_template is not None else None,
+                        idempotency_key,
+                        workspace_id or str(uuid.uuid4()),
+                        retry_of,
+                        attempt_no,
+                        input_set_id,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO runs (run_id, workflow, thread_id, status,
+                                      client_slug, config_json, image_tag,
+                                      job_template_json, idempotency_key)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        resolved_run_id,
+                        workflow,
+                        thread_id or resolved_run_id,  # one thread per run unless resuming
+                        RunStatus.QUEUED.value,
+                        client_slug,
+                        json.dumps(config),
+                        image_tag,
+                        json.dumps(job_template) if job_template is not None else None,
+                        idempotency_key,
+                    ),
+                )
             row = _require_returned(cur.fetchone(), "create_run")
-    except psycopg.errors.UniqueViolation:
+    except psycopg.errors.UniqueViolation as exc:
         # The concurrent winner already created the run under this key — return
         # theirs, which is exactly what an idempotency key promises. Only
         # reachable with a key set (the unique index is partial on NOT NULL).
         existing = find_by_idempotency_key(conn, idempotency_key) if idempotency_key else None
         if existing is not None:
             return existing
+        # Otherwise this is the OTHER partial unique index: a second live
+        # attempt on one workspace. Name it, because "duplicate key value
+        # violates unique constraint" tells an operator nothing about the
+        # actual rule ("finish or fail the running attempt first").
+        if "runs_active_workspace_uniq" in str(exc):
+            raise ActiveAttemptExists(
+                f"workspace {workspace_id} already has a queued/running/paused "
+                "attempt; a workspace carries at most one live attempt"
+            ) from exc
         raise
     _emit(conn, resolved_run_id, "created", {"workflow": workflow, "client_slug": client_slug})
     return RunRecord.from_row(row)
@@ -254,30 +339,292 @@ def claim_run(conn: DbConnection, run_id: str) -> RunRecord | None:
     return RunRecord.from_row(claimed)
 
 
+# --- v2: queue dispatch and leases (ORG-PLAN-164 WS2) -------------------------
+#
+# Everything in this section requires the data-plane columns and raises the
+# NAMED SchemaVersionMismatch on a v1 database instead of a KeyError or
+# UndefinedColumn in a background worker after the startup gate went green.
+
+
+def set_dispatch(conn: DbConnection, run_id: str, dispatch_id: str) -> None:
+    """Record the dispatch id BEFORE the message is enqueued.
+
+    Order matters: the row must already know its dispatch id when the message
+    lands, or a very fast runner could claim against a row that has not been
+    told which dispatch it belongs to and reject its own message.
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET dispatch_id = %s, updated_at = now() WHERE run_id = %s",
+                (dispatch_id, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "set_dispatch")
+
+
+def mark_dispatch_failed(conn: DbConnection, run_id: str, reason: str) -> None:
+    """Enqueue failed after the row was committed.
+
+    The row is deliberately NOT deleted. A run that exists but was never
+    dispatched is recoverable by an operator retry; a deleted row is a run the
+    client was told about and can never be told anything more about.
+    """
+    failure = {
+        "stage": "dispatch",
+        "error_type": "DispatchEnqueueFailed",
+        "message": reason[:2000],
+        "retryable": True,
+    }
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET error_json = %s, updated_at = now() WHERE run_id = %s",
+                (json.dumps(failure), run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "mark_dispatch_failed")
+    _emit(conn, run_id, "dispatch_failed", {"reason": reason[:2000]})
+
+
+def claim_dispatch(
+    conn: DbConnection,
+    *,
+    run_id: str,
+    dispatch_id: str,
+    owner: str,
+    lease_seconds: int,
+) -> RunRecord | None:
+    """Atomically claim a queue-dispatched run, or return None.
+
+    The queue body is a REFERENCE, never the source of truth, so every guard
+    lives here in one transaction:
+
+    * the row must exist and still be ``queued``;
+    * its ``dispatch_id`` must match the message — a stale message from a prior
+      dispatch of the same run cannot start a second writer;
+    * any existing lease must have expired — which is what makes crash recovery
+      safe rather than a race. A replacement worker becomes eligible only after
+      the dead worker's lease lapses, not merely because the queue made the
+      message visible again.
+
+    Returning None is a normal outcome (the message is a duplicate, or another
+    worker won); the caller deletes the message and exits cleanly.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM runs WHERE run_id = %s FOR UPDATE", (run_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        if "lease_expires_at" not in row:
+            raise SchemaVersionMismatch(
+                "claim_dispatch requires schema v2 (the workflow data plane); "
+                "the live registry is still v1. Run `wrc migrate` first."
+            )
+        if row["status"] != RunStatus.QUEUED.value:
+            return None
+        if str(row["dispatch_id"]) != str(dispatch_id):
+            return None
+        lease_expires_at = row["lease_expires_at"]
+        if lease_expires_at is not None and lease_expires_at > utcnow():
+            return None
+        cur.execute(
+            """
+            UPDATE runs
+               SET status = %s,
+                   lease_owner = %s,
+                   lease_expires_at = now() + make_interval(secs => %s),
+                   heartbeat_at = now(),
+                   delivery_count = delivery_count + 1,
+                   updated_at = now()
+             WHERE run_id = %s
+            RETURNING *
+            """,
+            (RunStatus.RUNNING.value, owner, lease_seconds, run_id),
+        )
+        claimed = _require_returned(cur.fetchone(), "claim_dispatch")
+    _emit(conn, run_id, "claimed", {"owner": owner, "dispatch_id": str(dispatch_id)})
+    return RunRecord.from_row(claimed)
+
+
+def renew_lease(
+    conn: DbConnection, *, run_id: str, owner: str, lease_seconds: int
+) -> bool:
+    """Extend this worker's lease. False means the lease was lost.
+
+    A worker that loses its lease must stop: something else has been told it may
+    claim this run, and two writers on one checkpoint thread interleave.
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET lease_expires_at = now() + make_interval(secs => %s),
+                       heartbeat_at = now(),
+                       updated_at = now()
+                 WHERE run_id = %s AND lease_owner = %s AND status = %s
+                RETURNING run_id
+                """,
+                (lease_seconds, run_id, owner, RunStatus.RUNNING.value),
+            )
+            return cur.fetchone() is not None
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "renew_lease")
+
+
+def release_lease(conn: DbConnection, run_id: str) -> None:
+    """Clear lease bookkeeping once a run reaches a settled state."""
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = now() WHERE run_id = %s",
+                (run_id,),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "release_lease")
+
+
+def requeue_expired_lease(conn: DbConnection, run_id: str) -> bool:
+    """Return a crashed run to ``queued`` once its lease has lapsed."""
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET status = %s, lease_owner = NULL, lease_expires_at = NULL,
+                       updated_at = now()
+                 WHERE run_id = %s AND status = %s
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at <= now()
+                RETURNING run_id
+                """,
+                (RunStatus.QUEUED.value, run_id, RunStatus.RUNNING.value),
+            )
+            found = cur.fetchone() is not None
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "requeue_expired_lease")
+    if found:
+        _emit(conn, run_id, "lease_expired")
+    return found
+
+
+def record_progress(conn: DbConnection, run_id: str, progress: dict[str, Any]) -> None:
+    """Persist a progress snapshot + heartbeat.
+
+    Rate limiting is the WORKER's job, not this function's: a graph emits node
+    events far faster than Postgres should be written, and the decision about
+    what is worth a round trip belongs where the event stream is.
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET progress_json = %s, heartbeat_at = now(), "
+                "updated_at = now() WHERE run_id = %s",
+                (json.dumps(progress), run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "record_progress")
+
+
+def mark_failed_structured(
+    conn: DbConnection, run_id: str, failure: dict[str, Any]
+) -> None:
+    """Terminal failure with a structured, client-safe payload.
+
+    ``failure`` carries {stage, error_type, message, retryable, correlation_id}.
+    The traceback stays in server logs keyed by correlation id — a client
+    payload is not the place for internal frames or paths.
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET status = %s, error = %s, error_json = %s,
+                       lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (
+                    RunStatus.FAILED.value,
+                    str(failure.get("message", ""))[:8000],
+                    json.dumps(failure),
+                    run_id,
+                ),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "mark_failed_structured")
+    _emit(conn, run_id, "failed", failure)
+
+
+# --- terminal transitions -----------------------------------------------------
+
+
 def mark_paused(conn: DbConnection, run_id: str, interrupt_payload: Any) -> None:
     """Run hit an ``interrupt()`` and is exiting. State lives in the checkpoint."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE runs SET status = %s, interrupt_payload = %s, updated_at = now() "
-            "WHERE run_id = %s",
-            (RunStatus.PAUSED.value, json.dumps(interrupt_payload), run_id),
+    if _data_plane_live(conn):
+        sql = (
+            "UPDATE runs SET status = %s, interrupt_payload = %s, "
+            "lease_owner = NULL, lease_expires_at = NULL, updated_at = now() "
+            "WHERE run_id = %s"
         )
+    else:
+        sql = (
+            "UPDATE runs SET status = %s, interrupt_payload = %s, updated_at = now() "
+            "WHERE run_id = %s"
+        )
+    with conn.cursor() as cur:
+        cur.execute(sql, (RunStatus.PAUSED.value, json.dumps(interrupt_payload), run_id))
     _emit(conn, run_id, "paused")
 
 
 def mark_completed(
-    conn: DbConnection, run_id: str, artifacts: dict[str, Any] | None = None
+    conn: DbConnection,
+    run_id: str,
+    artifacts: dict[str, Any] | None = None,
+    *,
+    artifacts_published: bool = False,
 ) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE runs SET status = %s, artifacts_json = %s, updated_at = now() "
-            "WHERE run_id = %s",
-            (
-                RunStatus.COMPLETED.value,
-                json.dumps(artifacts) if artifacts is not None else None,
-                run_id,
-            ),
-        )
+    """Flip a run to ``completed``, recording its artifacts in the SAME statement.
+
+    One UPDATE, not two: a client that saw ``completed`` with the descriptors not
+    yet written would poll a finished run and find nothing to download. Setting
+    ``artifacts_published`` stamps ``artifacts_published_at``, which is how the
+    maintenance pass tells "this run's outputs are in the container" from "this
+    run completed before publication existed".
+    """
+    if _data_plane_live(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET status = %s, artifacts_json = %s, "
+                "artifacts_published_at = CASE WHEN %s THEN now() "
+                "ELSE artifacts_published_at END, "
+                "lease_owner = NULL, lease_expires_at = NULL, updated_at = now() "
+                "WHERE run_id = %s",
+                (
+                    RunStatus.COMPLETED.value,
+                    json.dumps(artifacts) if artifacts is not None else None,
+                    artifacts_published,
+                    run_id,
+                ),
+            )
+    else:
+        if artifacts_published:
+            raise SchemaVersionMismatch(
+                "artifacts_published requires schema v2; the live registry is "
+                "still v1 — a publication stamp silently dropped here would lie "
+                "to the maintenance pass."
+            )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET status = %s, artifacts_json = %s, updated_at = now() "
+                "WHERE run_id = %s",
+                (
+                    RunStatus.COMPLETED.value,
+                    json.dumps(artifacts) if artifacts is not None else None,
+                    run_id,
+                ),
+            )
     _emit(conn, run_id, "completed")
 
 

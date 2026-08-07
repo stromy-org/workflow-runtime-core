@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from .binding import ExecutionBinding
 from .exceptions import (
+    ActiveAttemptExists,
     CheckpointerError,
     DependencyError,
     MigrationChecksumMismatch,
@@ -53,7 +54,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.1.4"
+__version__ = "0.2.0"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
@@ -77,6 +78,7 @@ __all__: list[str] = [
     "SchemaVersionMismatch",
     "TerminalProjection",
     "WorkflowRuntimeCoreError",
+    "ActiveAttemptExists",
     "apply_app_migrations",
     "apply_migrations",
     "pending",
