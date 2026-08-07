@@ -25,6 +25,7 @@ from .exceptions import (
     MigrationError,
     RegistryError,
     SchemaVersionMismatch,
+    StageFailure,
     WorkflowRuntimeCoreError,
 )
 from .migrations import (
@@ -55,7 +56,7 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
@@ -79,6 +80,7 @@ __all__: list[str] = [
     "RunRecord",
     "RunStatus",
     "SchemaVersionMismatch",
+    "StageFailure",
     "TerminalProjection",
     "WorkflowRuntimeCoreError",
     "ActiveAttemptExists",
