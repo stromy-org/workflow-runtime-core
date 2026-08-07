@@ -42,9 +42,24 @@ class _FakeGraph:
 
     context_schema = None
 
-    def __init__(self, *, sleep: float = 0.0, raises: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        sleep: float = 0.0,
+        raises: Exception | None = None,
+        until: asyncio.Event | None = None,
+    ) -> None:
         self.sleep = sleep
         self.raises = raises
+        #: When set, the graph runs until this event fires instead of for a
+        #: fixed wall-clock duration. Timing-based tests that assert "the lease
+        #: was renewed more than once" are load-sensitive — a 0.08s graph and a
+        #: 0.01s renewal interval *should* give ~8 renewals, but on a busy
+        #: machine the event loop is starved and it collapses to 1, failing a
+        #: test whose subject (renewal repeats during one invocation) is not
+        #: actually about the clock. Gating the graph on the renewal itself
+        #: makes the assertion deterministic under any load.
+        self.until = until
         self.checkpointer: Any = None
         self.observed: dict[str, Any] = {"cancelled": False, "invoked": False}
 
@@ -52,12 +67,16 @@ class _FakeGraph:
         self.observed["invoked"] = True
         if self.raises is not None:
             raise self.raises
-        if self.sleep:
-            try:
+        try:
+            if self.until is not None:
+                # Bounded so a genuinely broken renewal loop fails as a timeout
+                # rather than hanging the suite.
+                await asyncio.wait_for(self.until.wait(), timeout=30)
+            elif self.sleep:
                 await asyncio.sleep(self.sleep)
-            except asyncio.CancelledError:
-                self.observed["cancelled"] = True
-                raise
+        except asyncio.CancelledError:
+            self.observed["cancelled"] = True
+            raise
         return {"artifacts": {"report": "ok"}}
 
     async def aget_state(self, config: Any) -> Any:
@@ -107,15 +126,30 @@ class _Binding:
 
 
 class _Renewer:
-    """Grants ``grants`` renewals, then reports the lease lost."""
+    """Grants ``grants`` renewals, then reports the lease lost.
 
-    def __init__(self, *, grants: int, interval_seconds: float = 0.01) -> None:
+    ``release_after`` fires ``released`` once that many renewals have happened,
+    letting a graph run *until the property under test has been observed*
+    instead of for a guessed number of milliseconds.
+    """
+
+    def __init__(
+        self,
+        *,
+        grants: int,
+        interval_seconds: float = 0.01,
+        release_after: int | None = None,
+    ) -> None:
         self.interval_seconds = interval_seconds
         self._grants = grants
+        self._release_after = release_after
+        self.released = asyncio.Event()
         self.calls = 0
 
     async def renew(self) -> bool:
         self.calls += 1
+        if self._release_after is not None and self.calls >= self._release_after:
+            self.released.set()
         return self.calls <= self._grants
 
 
@@ -141,9 +175,15 @@ def _row(dsn: str, run_id: str) -> RunRecord:
 
 @pytest.mark.integration
 def test_a_leased_run_is_renewed_and_completes(blank_dsn: str) -> None:
+    """Renewal repeats *during* one graph invocation, rather than only at its
+    boundaries — a single node can run for minutes and must not lose its lease
+    mid-flight.
+
+    The graph finishes when the second renewal lands, so this asserts the real
+    property without depending on how fast the machine happens to be."""
     run = _claimed(blank_dsn)
-    renewer = _Renewer(grants=100)
-    binding = _Binding(_FakeGraph(sleep=0.08))
+    renewer = _Renewer(grants=100, release_after=2)
+    binding = _Binding(_FakeGraph(until=renewer.released))
 
     assert execute(run, binding, dsn=blank_dsn, lease=renewer) == EXIT_OK
     assert renewer.calls >= 2

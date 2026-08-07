@@ -41,7 +41,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 from .. import registry, schema
-from ..exceptions import LeaseLost, RegistryError
+from ..exceptions import LeaseLost, SchemaVersionMismatch
 from ..models import TERMINAL_STATUSES, RunRecord, RunStatus, TerminalProjection
 from .checkpointer import DURABILITY, acheckpointer, bind_checkpointer
 
@@ -334,18 +334,29 @@ def _finalize(run: RunRecord, projection: TerminalProjection, *, dsn: str | None
     One ``mark_*`` per outcome, and on v2 the completion carries the publication
     stamp in the same statement (see
     :attr:`~workflow_runtime_core.models.TerminalProjection.artifacts_published`).
+
+    **The outbox rows are written in this same transaction**, which is the whole
+    point of a transactional outbox: a crash between "the run is complete" and
+    "the reply was queued" would otherwise leave a finished run that owes a
+    message nobody recorded. Because both land together, recovery can safely
+    re-project a terminal snapshot — ``enqueue`` is idempotent on the stable
+    ``message_id``, so re-finalizing yields the same one message rather than a
+    second copy.
     """
-    if projection.outbox:  # pragma: no cover - lands with migration 0003
-        raise RegistryError(
-            "TerminalProjection.outbox requires the messaging tables (migration "
-            "0003, ORG-PLAN-155 Phase B), which this build's chain stops short of. "
-            "Upgrade workflow-runtime-core and migrate before emitting outbox rows."
-        )
+    from ..messaging import outbox as _outbox
 
     with registry.connect(dsn) as conn:
+        if projection.outbox:
+            _require_messaging_schema(conn)
+            _outbox.enqueue_all(conn, projection.outbox)
+
         if projection.status is RunStatus.FAILED:
             registry.mark_failed(conn, run.run_id, projection.error or "run failed")
-            logger.info("run %s failed via terminal projection", run.run_id)
+            logger.info(
+                "run %s failed via terminal projection (%d outbox message(s))",
+                run.run_id,
+                len(projection.outbox),
+            )
             return EXIT_FAILED
         registry.mark_completed(
             conn,
@@ -353,5 +364,28 @@ def _finalize(run: RunRecord, projection: TerminalProjection, *, dsn: str | None
             projection.artifacts,
             artifacts_published=projection.artifacts_published,
         )
-    logger.info("run %s completed", run.run_id)
+    logger.info(
+        "run %s completed (%d outbox message(s))", run.run_id, len(projection.outbox)
+    )
     return EXIT_OK
+
+
+def _require_messaging_schema(conn: registry.DbConnection) -> None:
+    """Fail with a NAMED error when the messaging tables are not there yet.
+
+    Without this the first outbox write against a v1/v2 database surfaces as an
+    ``UndefinedTable`` from deep inside a finalizer, *after* the startup gate
+    went green — the same "loud but late, and in the wrong place" shape the
+    2026-08-03 fork analysis documented. Raising here fails the run instead,
+    with a message naming the migration to apply.
+    """
+    from ..schema import read_schema_version
+
+    live = read_schema_version(conn)
+    if live is None or live < 3:
+        raise SchemaVersionMismatch(
+            f"TerminalProjection.outbox requires schema v3 (the durable messaging "
+            f"tables, migration 0003); the live registry is "
+            f"{'unmigrated' if live is None else f'v{live}'}. Run `wrc migrate` "
+            "before a binding emits outbox rows."
+        )

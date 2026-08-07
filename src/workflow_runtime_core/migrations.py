@@ -200,9 +200,187 @@ CREATE INDEX IF NOT EXISTS runs_lease_expires_at_idx ON runs (lease_expires_at)
 """
 
 
+# v3 (ORG-PLAN-155 Phase B, renumbered from B1b by the 2026-08-06 resolution):
+# the durable messaging boundary — inbox, launch, outbox, delivery receipts.
+# Purely additive: it creates four new tables and alters nothing 0002 defined,
+# so a v2-compiled reader keeps working against a v3 database untouched.
+#
+# Why these are CORE tables and not an app chain: the core's own ingress,
+# dispatcher, egress and receipt loops read and write them. The ownership rule
+# from the fork resolution is "anything the core reads or writes changes only
+# through the core's chain", so they belong here. A service's *own* additive
+# tables still go through `apply_app_migrations` under its own namespace.
+#
+# ``service_namespace`` appears in every uniqueness boundary rather than in a
+# table name. One database can host several services, and a per-service table
+# name would make "list every uncertain delivery" a query you cannot write
+# without first enumerating services. It is immutable after the first persisted
+# run precisely so these keys stay stable.
+#
+# Two leases, deliberately distinct:
+#   * ``runs.lease_owner``/``lease_expires_at`` (0002) — who is EXECUTING a run.
+#   * ``run_launches.lease_owner``/``lease_expires_at`` — who is LAUNCHING it.
+# They have different owners, different durations and different recovery rules;
+# collapsing them would make a slow launcher look like a dead runner.
+#
+# DEVIATION from the plan text, deliberate: the plan's 0003 bullet also listed
+# ``runs.next_attempt_at`` and ``runs.execution_ref``. Both are omitted. Launch
+# retry state is exactly what ``run_launches`` owns (ORG-191 decision 2: "a
+# launch has its own retry lifecycle; a retry must be a child row, not a
+# mutation of the run"), so putting the same two facts on ``runs`` as well would
+# create a second source of truth for them and guarantee they drift. Nothing in
+# the core reads them from ``runs``.
+_V3_DDL = """
+-- Inbound de-duplication. The unique key is the CHANNEL's own message id, so a
+-- redelivered broker message resolves to the run it already created instead of
+-- starting a second one. Written in the same transaction as the run and its
+-- launch; only that commit permits a broker acknowledgement.
+CREATE TABLE IF NOT EXISTS event_inbox (
+    inbox_id          UUID        PRIMARY KEY,
+    service_namespace TEXT        NOT NULL,
+    source            TEXT        NOT NULL,
+    source_message_id TEXT        NOT NULL,
+    run_id            UUID        NOT NULL REFERENCES runs (run_id) ON DELETE CASCADE,
+    envelope_json     JSONB       NOT NULL,
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- THE idempotency barrier for ingress. Not a plain index: the INSERT relies on
+-- the conflict to return the original run_id.
+CREATE UNIQUE INDEX IF NOT EXISTS event_inbox_source_uniq
+    ON event_inbox (service_namespace, source, source_message_id);
+
+CREATE INDEX IF NOT EXISTS event_inbox_run_id_idx ON event_inbox (run_id);
+-- Retention purge scans by age within a namespace.
+CREATE INDEX IF NOT EXISTS event_inbox_received_at_idx
+    ON event_inbox (service_namespace, received_at);
+
+
+-- One launch per run: the dispatcher's durable record of having asked some
+-- launcher to start it. ``params_hash`` makes a redundant dispatch detectable
+-- rather than merely duplicated, and ``execution_ref`` is whatever the launcher
+-- can be asked about later (a subprocess pid, an ECS task ARN).
+CREATE TABLE IF NOT EXISTS run_launches (
+    run_id           UUID        PRIMARY KEY REFERENCES runs (run_id) ON DELETE CASCADE,
+    launcher         TEXT        NOT NULL,
+    state            TEXT        NOT NULL CHECK (state IN (
+                         'pending','launching','launched','failed')),
+    params_hash      TEXT        NOT NULL,
+    attempts         INTEGER     NOT NULL DEFAULT 0,
+    next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_owner      TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    execution_ref    TEXT,
+    last_error       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The dispatcher's claim query, verbatim: due rows in a claimable state,
+-- oldest first. Partial so the index stays small as launched rows accumulate.
+CREATE INDEX IF NOT EXISTS run_launches_due_idx
+    ON run_launches (next_attempt_at)
+    WHERE state IN ('pending', 'failed');
+
+-- The reconciler's query: launches stuck in-flight past their lease.
+CREATE INDEX IF NOT EXISTS run_launches_stale_idx
+    ON run_launches (lease_expires_at)
+    WHERE state = 'launching';
+
+
+-- Transactional outbox. A terminal run writes its messages here in the SAME
+-- transaction that records the terminal state, so a crash between "the work is
+-- done" and "the reply was sent" cannot lose the reply.
+CREATE TABLE IF NOT EXISTS event_outbox (
+    outbox_id         UUID        PRIMARY KEY,
+    service_namespace TEXT        NOT NULL,
+    message_id        TEXT        NOT NULL,
+    run_id            UUID        REFERENCES runs (run_id) ON DELETE CASCADE,
+    destination       TEXT        NOT NULL,
+    payload_json      JSONB       NOT NULL,
+    status            TEXT        NOT NULL CHECK (status IN (
+                          'pending','publishing','delivered','failed')),
+    attempts          INTEGER     NOT NULL DEFAULT 0,
+    next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_owner       TEXT,
+    lease_expires_at  TIMESTAMPTZ,
+    last_error        TEXT,
+    delivered_at      TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Stable message identity. Re-projecting a terminal run must reuse its message,
+-- not mint a second one, so finalization inserts ON CONFLICT DO NOTHING against
+-- this key. It is also the key downstream consumers deduplicate on, which is
+-- what makes at-least-once transport honest rather than lossy.
+CREATE UNIQUE INDEX IF NOT EXISTS event_outbox_message_uniq
+    ON event_outbox (service_namespace, message_id);
+
+CREATE INDEX IF NOT EXISTS event_outbox_due_idx
+    ON event_outbox (next_attempt_at)
+    WHERE status IN ('pending', 'failed');
+
+CREATE INDEX IF NOT EXISTS event_outbox_stale_idx
+    ON event_outbox (lease_expires_at)
+    WHERE status = 'publishing';
+
+CREATE INDEX IF NOT EXISTS event_outbox_run_id_idx
+    ON event_outbox (run_id) WHERE run_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS event_outbox_delivered_at_idx
+    ON event_outbox (service_namespace, delivered_at)
+    WHERE delivered_at IS NOT NULL;
+
+
+-- External-send outcomes, per destination. Separate from event_outbox because
+-- they answer a different question: the outbox tracks "did we hand it to our
+-- own broker", this tracks "did the PROVIDER accept it".
+--
+-- ``uncertain`` is the load-bearing status and the reason this table exists. A
+-- timeout, a connection lost after the request was written, or a crash during
+-- 'sending' leaves an outcome nobody can observe. Blind retry would double-send
+-- a WhatsApp message to a real person; blind success would silently drop it.
+-- Neither is acceptable, so the state is recorded as what it actually is and
+-- raised for reconciliation. This is why no exactly-once claim appears anywhere
+-- in this codebase.
+CREATE TABLE IF NOT EXISTS delivery_receipts (
+    service_namespace TEXT        NOT NULL,
+    destination       TEXT        NOT NULL,
+    message_id        TEXT        NOT NULL,
+    status            TEXT        NOT NULL CHECK (status IN (
+                          'pending','sending','delivered','failed','uncertain')),
+    attempts          INTEGER     NOT NULL DEFAULT 0,
+    next_attempt_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    provider_ref      TEXT,
+    lease_owner       TEXT,
+    lease_expires_at  TIMESTAMPTZ,
+    last_error        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (service_namespace, destination, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS delivery_receipts_due_idx
+    ON delivery_receipts (next_attempt_at)
+    WHERE status IN ('pending', 'failed');
+
+CREATE INDEX IF NOT EXISTS delivery_receipts_stale_idx
+    ON delivery_receipts (lease_expires_at)
+    WHERE status = 'sending';
+
+-- The operator's reconciliation worklist. Partial and tiny by construction:
+-- if this index is large, something is systematically ambiguous and that is
+-- itself the alert.
+CREATE INDEX IF NOT EXISTS delivery_receipts_uncertain_idx
+    ON delivery_receipts (service_namespace, updated_at)
+    WHERE status = 'uncertain';
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="run_registry_v1", sql=_V1_DDL),
     Migration(version=2, name="workflow_data_plane_v2", sql=_V2_DDL),
+    Migration(version=3, name="durable_messaging_v3", sql=_V3_DDL),
 )
 
 #: Highest version this build knows how to apply.

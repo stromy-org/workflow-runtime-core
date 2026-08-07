@@ -20,16 +20,22 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .registry import DbConnection
 
 #: Inclusive range of live schema versions this build can read and write.
-#: v0.2.0 accepts [1, 2]: the shared production registry stays at v1 during the
-#: expansion window while ephemeral/pilot databases run v2. Functions that need
-#: a v2 column raise a NAMED error on v1 instead of a KeyError in a worker.
+#: Accepts [1, 3]: the shared production registry stays at its own version
+#: during the expansion window while ephemeral/pilot databases run ahead.
+#: Functions that need a v2 column raise a NAMED error on v1 instead of a
+#: KeyError in a worker; the v3 messaging surfaces do the same on v1/v2.
+#:
+#: The range only ever widens at the top. A deployment stops at the version it
+#: needs — the hosted plane at v2, a durable client service (ORG-PLAN-155
+#: Phase C) at v3 — and a reader compiled for v3 serves all three, which is the
+#: property that lets readers roll out ahead of any migration.
 SUPPORTED_SCHEMA_MIN = 1
-SUPPORTED_SCHEMA_MAX = 2
+SUPPORTED_SCHEMA_MAX = 3
 
 #: The version a fresh ``wrc migrate`` produces. Kept distinct from the MAX
 #: above: they diverge during an expand/migrate/contract window, where a build
 #: can READ a version it does not yet write by default.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def read_schema_version(conn: DbConnection) -> int | None:

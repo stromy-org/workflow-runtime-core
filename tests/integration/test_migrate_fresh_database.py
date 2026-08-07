@@ -22,7 +22,7 @@ thing every new deployment does and the one thing an existing one never does.
 
 from __future__ import annotations
 
-import os
+import uuid
 
 import pytest
 
@@ -30,22 +30,27 @@ from workflow_runtime_core import registry
 from workflow_runtime_core.migrations import LATEST_VERSION, apply_migrations
 from workflow_runtime_core.schema import read_schema_version, require_compatible_schema
 
-_DSN_ENV = "STROMY_PG_DSN"
-
 
 @pytest.fixture(scope="module")
-def fresh_dsn():
-    """An EMPTY database — deliberately not migrated by the fixture."""
-    provided = os.environ.get(_DSN_ENV, "").strip()
-    if provided:
-        yield provided
-        return
-    testcontainers = pytest.importorskip(
-        "testcontainers.postgres",
-        reason=f"neither {_DSN_ENV} nor testcontainers is available",
-    )
-    with testcontainers.PostgresContainer("postgres:16-alpine") as pg:
-        yield pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
+def fresh_dsn(admin_dsn: str):
+    """An EMPTY database — genuinely empty, not merely assumed to be.
+
+    It creates its own database rather than handing back ``$STROMY_PG_DSN``.
+    The earlier version returned the provided DSN untouched, so every assertion
+    here ("unmigrated", "no schema_meta") silently depended on that server
+    having never been used — true for a throwaway testcontainer, false the
+    moment anyone runs the suite against a persistent local PostgreSQL, which
+    the conftest documents as supported. The tests then fail claiming the probe
+    is broken when the only thing wrong is the fixture.
+    """
+    import psycopg
+
+    name = f"fresh_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')  # noqa: S608 - generated name
+        conn.execute(f'CREATE DATABASE "{name}"')  # noqa: S608 - generated name
+    head, _, _tail = admin_dsn.rpartition("/")
+    yield f"{head}/{name}"
 
 
 @pytest.mark.integration
