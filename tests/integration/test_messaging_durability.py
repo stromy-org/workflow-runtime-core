@@ -522,3 +522,196 @@ def test_purge_keeps_a_paused_runs_envelope(blank_dsn: str) -> None:
             )
         assert inbox.purge_inbox(conn, service_namespace=NS, older_than_days=30) == 0
         assert inbox.get_envelope(conn, result.run_id) is not None
+
+
+# --- 5b. the identity claim: what a push-based consumer is allowed to send ----
+#
+# The lane consumers are pushed to by the broker, so they cannot choose which
+# receipt to work on. `claim` is the seam that decides whether the message in
+# their hand may actually go out to a person, and every one of these tests is a
+# case where sending would be wrong.
+
+
+def _opened(conn: registry.DbConnection, message_id: str) -> None:
+    receipts.open_receipt(
+        conn, service_namespace=NS, destination="whatsapp", message_id=message_id
+    )
+
+
+def _claim(conn: registry.DbConnection, message_id: str, owner: str, lease: int = 60):
+    return receipts.claim(
+        conn,
+        service_namespace=NS,
+        destination="whatsapp",
+        message_id=message_id,
+        owner=owner,
+        lease_seconds=lease,
+    )
+
+
+@pytest.mark.integration
+def test_the_identity_claim_takes_the_row_it_was_given(blank_dsn: str) -> None:
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        # A second, older, due row exists. claim_due would take THIS one; the
+        # identity claim must not, because the caller holds the other payload.
+        _opened(conn, "other")
+        _opened(conn, "mine")
+
+        claimed = _claim(conn, "mine", "consumer-a")
+        assert claimed is not None
+        assert claimed.message_id == "mine"
+        assert claimed.attempts == 1
+
+        other = receipts.get_receipt(
+            conn, service_namespace=NS, destination="whatsapp", message_id="other"
+        )
+        assert other is not None
+        assert other.status == "pending"
+        assert other.lease_owner is None
+
+
+@pytest.mark.integration
+def test_a_redelivered_message_is_not_sent_twice(blank_dsn: str) -> None:
+    """THE duplicate-suppression test. The outbound queue is at-least-once, so
+    this exact redelivery is expected — and a second WhatsApp message to a real
+    customer is the failure this whole module exists to prevent."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        _opened(conn, "r-dup")
+        assert _claim(conn, "r-dup", "consumer-a") is not None
+        assert receipts.mark_delivered(
+            conn,
+            service_namespace=NS,
+            destination="whatsapp",
+            message_id="r-dup",
+            owner="consumer-a",
+            provider_ref="SM123",
+        )
+
+        # The broker redelivers. The consumer asks again and is refused.
+        assert _claim(conn, "r-dup", "consumer-b") is None
+
+        settled = receipts.get_receipt(
+            conn, service_namespace=NS, destination="whatsapp", message_id="r-dup"
+        )
+        assert settled is not None
+        assert settled.status == "delivered"
+        assert settled.provider_ref == "SM123"
+        # Refusal must not look like an attempt, or the count stops meaning
+        # "times we actually called the provider".
+        assert settled.attempts == 1
+
+
+@pytest.mark.integration
+def test_an_uncertain_receipt_is_never_reclaimed_by_a_redelivery(
+    blank_dsn: str,
+) -> None:
+    """A human owns this row. A redelivery must not drag it back into the loop —
+    that is the blind retry that double-sends."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        _opened(conn, "r-unc")
+        _claim(conn, "r-unc", "consumer-a")
+        receipts.mark_uncertain(
+            conn,
+            service_namespace=NS,
+            destination="whatsapp",
+            message_id="r-unc",
+            owner="consumer-a",
+            reason="timeout after send",
+        )
+        assert _claim(conn, "r-unc", "consumer-b") is None
+
+
+@pytest.mark.integration
+def test_a_live_lease_blocks_a_concurrent_consumer(blank_dsn: str) -> None:
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        _opened(conn, "r-race")
+        assert _claim(conn, "r-race", "consumer-a") is not None
+        assert _claim(conn, "r-race", "consumer-b") is None
+
+
+@pytest.mark.integration
+def test_a_lapsed_lease_is_reclaimed_without_waiting_for_reconciliation(
+    blank_dsn: str,
+) -> None:
+    """A consumer died mid-send and the broker redelivered. The replacement must
+    be able to take the row now; making it wait for a reconciliation pass would
+    stall the lane for no reason."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        _opened(conn, "r-lapsed")
+        assert _claim(conn, "r-lapsed", "dead-consumer", lease=60) is not None
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE delivery_receipts SET lease_expires_at = now() - interval '1s'"
+            )
+
+        reclaimed = _claim(conn, "r-lapsed", "live-consumer")
+        assert reclaimed is not None
+        assert reclaimed.lease_owner == "live-consumer"
+        assert reclaimed.attempts == 2
+
+        # And the dead consumer, waking up, cannot settle what it no longer owns.
+        assert not receipts.mark_delivered(
+            conn,
+            service_namespace=NS,
+            destination="whatsapp",
+            message_id="r-lapsed",
+            owner="dead-consumer",
+        )
+
+
+@pytest.mark.integration
+def test_a_failed_send_is_reclaimable_immediately_on_the_push_path(
+    blank_dsn: str,
+) -> None:
+    """The broker is the retry scheduler on this path. If the claim also honoured
+    the row's backoff, the consumer would refuse the delivery it was just handed
+    and ack nothing — two schedulers, one message, and a spin."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        _opened(conn, "r-retry")
+        claimed = _claim(conn, "r-retry", "consumer-a")
+        assert claimed is not None
+        receipts.mark_failed(
+            conn,
+            service_namespace=NS,
+            destination="whatsapp",
+            message_id="r-retry",
+            owner="consumer-a",
+            error="421 try again later",
+            attempts=claimed.attempts,
+        )
+        # next_attempt_at is now in the future; the pull path would skip it.
+        assert (
+            receipts.claim_due(
+                conn,
+                service_namespace=NS,
+                destination="whatsapp",
+                owner="puller",
+                lease_seconds=60,
+            )
+            == []
+        )
+        # The push path takes it, because the broker already said "now".
+        assert _claim(conn, "r-retry", "consumer-a") is not None
+
+
+@pytest.mark.integration
+def test_claiming_an_unopened_receipt_returns_none(blank_dsn: str) -> None:
+    """A caller that skipped open_receipt must not silently send unrecorded."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        assert _claim(conn, "never-opened", "consumer-a") is None
+        assert (
+            receipts.get_receipt(
+                conn,
+                service_namespace=NS,
+                destination="whatsapp",
+                message_id="never-opened",
+            )
+            is None
+        )

@@ -47,6 +47,14 @@ jobs:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Explicit scope: the token pushes/opens a PR on THIS repo and
+          # clones the private `python-library-template` — both must be listed.
+          # With create-github-app-token@v2, `owner` without `repositories`
+          # does NOT grant the whole installation (unlike @v1) — verified
+          # live 2026-08-07: the minted token could not see the template.
+          repositories: |
+            ${{ github.event.repository.name }}
+            python-library-template
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -124,7 +132,11 @@ jobs:
       - name: File conflict tracking issue
         if: steps.update.outputs.conflict == 'true'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          # In-repo issue writes use the workflow's own token — the
+          # permissions block above already grants it; the stromy-ci App
+          # deliberately lacks Issues permission (verified 2026-08-06:
+          # createIssue 403'd on fetch-kit-mcp's copier-update conflict path).
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TITLE="copier update: merge conflicts need manual reconciliation"

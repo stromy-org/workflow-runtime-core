@@ -15,6 +15,9 @@ acquiring LangGraph or aio-pika.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
+
 from .binding import ExecutionBinding, LeaseRenewer
 from .exceptions import (
     ActiveAttemptExists,
@@ -58,7 +61,14 @@ from .schema import (
     require_compatible_schema,
 )
 
-__version__ = "0.4.0"
+# Read from the installed distribution rather than restated here. The hardcoded
+# copy had drifted to 0.4.0 while the package shipped 0.6.0 — a version string
+# that lies is worse than none, because it is exactly what someone reads when
+# working out which build a production replica is running.
+try:
+    __version__ = _metadata_version("workflow-runtime-core")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    __version__ = "0.0.0.dev0"
 
 __all__: list[str] = [
     "CORE_NAMESPACE",
