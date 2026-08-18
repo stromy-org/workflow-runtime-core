@@ -377,10 +377,33 @@ CREATE INDEX IF NOT EXISTS delivery_receipts_uncertain_idx
 """
 
 
+_V4_DDL = """
+-- Server-derived execution metadata (ORG-PLAN-206 C5).
+--
+-- ONE nullable JSONB column, deliberately. The facade pins a snapshot of the
+-- decisions it made when the run was created — which credential policy applies,
+-- which credential IDs that resolved to, which model-registry digest it was
+-- computed against — and the runner reads that snapshot back instead of
+-- recomputing it. Recomputation is the bug this column prevents: an entitlement
+-- edited between a failed run and its retry would otherwise silently move who
+-- pays for the second attempt, and the client would have approved neither.
+--
+-- Additive and nullable so it is an EXPAND step: a reader compiled before this
+-- migration selects ``*`` and simply never looks at the key, which is what lets
+-- readers deploy ahead of the migration and writers after it.
+--
+-- The column is never caller-writable. Nothing in it is a secret — it holds
+-- credential *identifiers* and source *labels*, never values, never aliases and
+-- never any statement about which environment variables exist.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_metadata_json JSONB;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="run_registry_v1", sql=_V1_DDL),
     Migration(version=2, name="workflow_data_plane_v2", sql=_V2_DDL),
     Migration(version=3, name="durable_messaging_v3", sql=_V3_DDL),
+    Migration(version=4, name="execution_metadata_v4", sql=_V4_DDL),
 )
 
 #: Highest version this build knows how to apply.

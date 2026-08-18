@@ -54,6 +54,22 @@ class RetryNotAllowed(RegistryError):
     """
 
 
+class ExecutionMetadataConflict(RegistryError):
+    """A run's server-derived execution snapshot was already pinned differently.
+
+    The snapshot is written once, at run creation, and is then immutable for the
+    life of the run and every attempt of it. This is raised when something tries
+    to pin a *different* snapshot over an existing one — re-pinning an identical
+    snapshot is a no-op, so an idempotent create path retries safely.
+
+    Immutability is the whole point of the column. Requirements and entitlements
+    are editable by design, so a runner that recomputed them per attempt would
+    let an edit made between a failure and its retry move who pays for the second
+    attempt — silently, and without the client ever approving it. Raising here
+    means that attempt is refused rather than repriced.
+    """
+
+
 class StageFailure(WorkflowRuntimeCoreError, RuntimeError):
     """A binding-raised failure that names the pipeline stage it happened in.
 

@@ -24,6 +24,7 @@ its type annotations without acquiring the executor extra.
 
 from __future__ import annotations
 
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from .models import RunRecord, TerminalProjection
@@ -85,6 +86,41 @@ class ExecutionBinding(Protocol):
         can never be ``completed`` while its outputs are missing. Raising instead
         leaves the run failed-and-retryable with its workspace intact.
         """
+        ...
+
+
+@runtime_checkable
+class ScopedExecutionBinding(ExecutionBinding, Protocol):
+    """An :class:`ExecutionBinding` that also needs process state bound per run.
+
+    OPTIONAL, and deliberately a separate protocol rather than a method on
+    :class:`ExecutionBinding` with a default. Every existing consumer keeps
+    working untouched because the runner probes for the attribute — a binding
+    that does not define it gets a no-op scope, which is the correct behaviour
+    and not a degraded one.
+
+    The scope is entered BEFORE ``resolve_graph`` and exited in a ``finally``.
+    Both halves are load-bearing, and for different reasons:
+
+    * **Before resolution**, because a graph is resolved and compiled against
+      whatever the process environment says at that moment. A binding that binds
+      credentials after resolution has already let a module-level provider
+      client capture the wrong ones.
+    * **In a ``finally``**, because the interesting failure is the exception. A
+      scope that only unwinds on success leaves whatever it bound in place for
+      the rest of the process — and in the BYOK case (ORG-PLAN-206) what it bound
+      is one client's provider key, sitting in an environment that a later
+      operator-funded code path would happily read.
+
+    Raise from ``__aenter__`` to fail the run before any graph work happens. The
+    runner records the raised exception's ``.stage`` when it declares one (see
+    :class:`~workflow_runtime_core.exceptions.StageFailure`), so a binding can
+    say ``credentials`` and have a client-facing surface report where the run
+    died without exposing why.
+    """
+
+    def execution_scope(self, run: RunRecord) -> AbstractAsyncContextManager[None]:
+        """Bind per-run process state for the duration of the execution."""
         ...
 
 

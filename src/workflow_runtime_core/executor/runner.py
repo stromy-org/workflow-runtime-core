@@ -56,6 +56,7 @@ from .progress import DEFAULT_PROGRESS_INTERVAL_SECONDS, ProgressRecorder
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator, Awaitable
+    from contextlib import AbstractAsyncContextManager
 
     from ..binding import ExecutionBinding, LeaseRenewer
 
@@ -184,6 +185,23 @@ async def _with_lease_renewal(
             task.cancel()
 
 
+def _execution_scope(
+    binding: ExecutionBinding, run: RunRecord
+) -> AbstractAsyncContextManager[None]:
+    """The binding's per-run scope, or a no-op for the bindings without one.
+
+    Probed by attribute rather than required on the protocol, so every consumer
+    that predates
+    :class:`~workflow_runtime_core.binding.ScopedExecutionBinding` keeps working
+    with no edit and no shim. ``nullcontext`` is a real no-op, not a degraded
+    mode: a binding with nothing to bind genuinely has nothing to unwind.
+    """
+    scope = getattr(binding, "execution_scope", None)
+    if scope is None:
+        return contextlib.nullcontext()
+    return cast("AbstractAsyncContextManager[None]", scope(run))
+
+
 def execute(
     run: RunRecord,
     binding: ExecutionBinding,
@@ -213,6 +231,24 @@ def execute(
     )
 
     async def _drive() -> tuple[str, Any]:
+        # The scope wraps EVERYTHING, opened before the graph is resolved and
+        # closed by the stack on the way out — success, failure and cancellation
+        # alike. An ``AsyncExitStack`` rather than a bare ``async with`` because
+        # entry failures need their own stage label: a binding that cannot bind a
+        # run's credentials has not failed at ``graph``, and saying so is what
+        # lets a client-facing surface report "this run died acquiring its
+        # credentials" without exposing anything about which ones.
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                await stack.enter_async_context(_execution_scope(binding, run))
+            except Exception as exc:
+                raise _StageError(_declared_stage(exc, "execution_scope"), "", exc) from exc
+
+            return await _drive_scoped()
+
+        raise AssertionError("unreachable")  # pragma: no cover - stack never swallows
+
+    async def _drive_scoped() -> tuple[str, Any]:
         try:
             graph = await binding.resolve_graph(run.workflow)
         except Exception as exc:
