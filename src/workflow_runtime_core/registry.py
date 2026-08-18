@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
@@ -35,6 +36,7 @@ from psycopg.rows import dict_row
 
 from .exceptions import (
     ActiveAttemptExists,
+    ExecutionMetadataConflict,
     RegistryError,
     RetryNotAllowed,
     SchemaVersionMismatch,
@@ -117,6 +119,67 @@ def _emit(conn: DbConnection, run_id: str, kind: str, detail: Any = None) -> Non
             "INSERT INTO run_events (run_id, kind, detail) VALUES (%s, %s, %s)",
             (run_id, kind, json.dumps(detail) if detail is not None else None),
         )
+
+
+#: Event kinds this module writes itself. A consumer may not reuse one: the
+#: lifecycle reads them back, and a second writer of ``completed`` would make the
+#: event log disagree with the status column it is supposed to explain.
+CORE_EVENT_KINDS = frozenset(
+    {
+        "created",
+        "retried",
+        "claimed",
+        "dispatch_failed",
+        "lease_expired",
+        "paused",
+        "resume_requested",
+        "cancelled",
+        "completed",
+        "failed",
+        "retention_started",
+    }
+)
+
+_EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def record_event(
+    conn: DbConnection, run_id: str, kind: str, detail: dict[str, Any] | None = None
+) -> None:
+    """Append one consumer-owned event to a run's durable timeline.
+
+    This exists so application code stops reaching for ``_emit``. A private name
+    imported across a package boundary is a contract with no test: the workflow
+    facade and Stromy both wrote run events through it, so any change to its
+    signature would have broken two repositories with no compile-time signal in
+    either.
+
+    Two rules the private helper never enforced:
+
+    * ``kind`` is validated, because it is a QUERIED value. A kind with a space
+      or a capital in it is invisible to every existing filter, and nobody finds
+      out until an incident — when the events that would have explained it do
+      not come back.
+    * A :data:`CORE_EVENT_KINDS` value is refused. Those are lifecycle facts
+      written by this module in the same transaction as the status change they
+      describe; a consumer writing a second ``completed`` produces a timeline
+      that contradicts the run row.
+
+    ``detail`` must be a JSON object and is stored verbatim. It is read by
+    operators and, for some kinds, projected to clients — so keeping secrets out
+    of it is the caller's job. Nothing here redacts.
+    """
+    if not _EVENT_KIND_RE.match(kind):
+        raise RegistryError(
+            f"invalid event kind {kind!r}: use lowercase letters, digits and "
+            "underscores (it is a queried value, not a sentence)"
+        )
+    if kind in CORE_EVENT_KINDS:
+        raise RegistryError(
+            f"event kind {kind!r} is written by the run lifecycle itself; a "
+            "second writer would contradict the run row. Choose a distinct kind."
+        )
+    _emit(conn, run_id, kind, detail)
 
 
 def new_run_id() -> str:
@@ -484,6 +547,150 @@ def set_input_set(conn: DbConnection, run_id: str, input_set_id: str) -> None:
             )
     except psycopg.errors.UndefinedColumn as exc:
         _require_data_plane_column(exc, "set_input_set")
+
+
+# --- execution metadata (schema v4, ORG-PLAN-206) -----------------------------
+
+def _require_execution_metadata_column(
+    exc: psycopg.errors.UndefinedColumn, feature: str
+) -> NoReturn:
+    raise SchemaVersionMismatch(
+        f"{feature} requires schema v4 (execution metadata); the live registry "
+        "predates it. Run `wrc migrate` before enabling this path."
+    ) from exc
+
+
+def pin_execution_metadata(
+    conn: DbConnection, run_id: str, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Write a run's server-derived execution snapshot exactly once.
+
+    Compare-and-set against *absent*: the first writer wins, a second writer of
+    the identical snapshot is a no-op, and a second writer of a DIFFERENT
+    snapshot raises
+    :class:`~workflow_runtime_core.exceptions.ExecutionMetadataConflict`. That
+    last case is the one worth naming — it is a retry or a resume trying to
+    reprice itself against an entitlement that changed underneath it.
+
+    ``metadata`` is server-derived and must stay that way. Nothing here checks
+    where it came from, so the caller carries that: a value a client can
+    influence does not belong in a snapshot whose entire purpose is to be the
+    thing the client cannot influence.
+
+    Returns the snapshot now pinned to the run — the caller's on a first write,
+    the pre-existing one on an idempotent repeat.
+    """
+    payload = json.dumps({"pinned": metadata})
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET execution_metadata_json = %s, updated_at = now() "
+                "WHERE run_id = %s AND execution_metadata_json IS NULL "
+                "RETURNING run_id",
+                (payload, run_id),
+            )
+            if cur.fetchone() is not None:
+                return dict(metadata)
+
+            cur.execute(
+                "SELECT execution_metadata_json AS meta FROM runs WHERE run_id = %s",
+                (run_id,),
+            )
+            row = cur.fetchone()
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "pin_execution_metadata")
+
+    if row is None:
+        raise RegistryError(f"run {run_id} not found")
+    stored = cast("dict[str, Any]", row["meta"] or {})
+    existing = stored.get("pinned")
+    if existing != metadata:
+        raise ExecutionMetadataConflict(
+            f"run {run_id} already has a different pinned execution snapshot. "
+            "The snapshot is immutable for the life of the run, so a retry "
+            "cannot be repriced by an entitlement edited since it started."
+        )
+    # ``existing == metadata`` is established by the check above, so returning
+    # the caller's copy says the same thing without another cast.
+    return dict(metadata)
+
+
+def read_execution_metadata(conn: DbConnection, run_id: str) -> dict[str, Any] | None:
+    """The pinned snapshot, or ``None`` when the run carries none.
+
+    ``None`` is honest and load-bearing: it is what every run created before this
+    column existed looks like, and what a run created by a facade that has not
+    yet been upgraded looks like. A caller that requires a snapshot must say so
+    itself rather than reading an empty dict as "declares nothing" — those are
+    opposite statements, and conflating them is exactly how a client-mode run
+    would fall through to operator credentials.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT execution_metadata_json AS meta FROM runs WHERE run_id = %s",
+                (run_id,),
+            )
+            row = cur.fetchone()
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "read_execution_metadata")
+    if row is None:
+        raise RegistryError(f"run {run_id} not found")
+    stored = cast("dict[str, Any]", row["meta"] or {})
+    pinned = stored.get("pinned")
+    if not isinstance(pinned, dict):
+        return None
+    return dict(cast("dict[str, Any]", pinned))
+
+
+def record_credential_sources(
+    conn: DbConnection, run_id: str, sources: dict[str, str], *, attempt_no: int = 1
+) -> None:
+    """Record WHERE each credential came from, per attempt. Never any value.
+
+    Written by the runner once it has resolved the run's credentials, so an
+    operator — and, through the public projection, the client — can answer "whose
+    key paid for this?" from the run row rather than from a provider dashboard.
+
+    Values are LABELS: ``client-registered``, ``operator-env``. They are chosen
+    so the answer never depends on the environment being observable.
+    ``operator-env`` says the platform funded the attempt; it deliberately does
+    not say which variable was read, whether it was set, or anything about its
+    value.
+
+    Kept OUTSIDE the pinned snapshot on purpose. The pin is what was decided
+    before the run started and is immutable; this is what was observed while it
+    ran, and each attempt observes for itself — a retry re-reads its values, so
+    it gets its own entry instead of overwriting the first attempt's account of
+    what happened.
+    """
+    # Annotated ``str``, checked anyway. The annotation is advice; this is the
+    # only thing standing between a caller's mistake and a provider key landing
+    # in a column that gets projected to the client.
+    if not all(isinstance(value, str) for value in cast("dict[str, object]", sources).values()):
+        raise RegistryError("credential sources must be label strings, never values")
+    entry = json.dumps({str(attempt_no): dict(sources)})
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET execution_metadata_json =
+                         coalesce(execution_metadata_json, '{}'::jsonb)
+                         || jsonb_build_object(
+                              'credential_sources',
+                              coalesce(
+                                  execution_metadata_json -> 'credential_sources',
+                                  '{}'::jsonb
+                              ) || %s::jsonb
+                            ),
+                       updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (entry, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "record_credential_sources")
 
 
 def mark_dispatch_failed(conn: DbConnection, run_id: str, reason: str) -> None:

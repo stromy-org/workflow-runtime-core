@@ -34,6 +34,28 @@ TERMINAL_STATUSES = frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.
 TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
 
 
+#: The ONLY keys :func:`public_execution_metadata` will ever emit.
+#:
+#: An allowlist rather than a denylist, because the two fail in opposite
+#: directions: a forgotten denylist entry LEAKS the new field, a forgotten
+#: allowlist entry merely omits it. Everything else in the stored column — the
+#: credential policy, the subject, the model-registry digest — is operator-facing
+#: detail about how the platform is configured, and a client can act on none of
+#: it.
+PUBLIC_EXECUTION_METADATA_KEYS = frozenset({"credential_sources"})
+
+
+def public_execution_metadata(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Project the stored execution-metadata column to what a client may see.
+
+    Takes the WHOLE column — pinned block and all — and returns only the
+    allowlisted keys. The pinned block is never projected.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k in PUBLIC_EXECUTION_METADATA_KEYS}
+
+
 @dataclass(frozen=True)
 class RunRecord:
     """One hosted run. Mirrors a ``runs`` row.
@@ -72,6 +94,14 @@ class RunRecord:
     delivery_count: int = 0
     artifacts_published_at: datetime | None = None
     input_set_id: str | None = None
+    # --- v4: server-derived execution metadata (ORG-PLAN-206) ----------------
+    #: The whole stored column, ``{"pinned": …, "credential_sources": …}``, or
+    #: ``None`` on a registry that predates v4. Read through
+    #: ``registry.read_execution_metadata`` for the pinned block and through
+    #: :func:`public_execution_metadata` for the client-safe view; the raw dict
+    #: is here because :meth:`public` needs it and a second query would race the
+    #: row it is projecting.
+    execution_metadata_json: dict[str, Any] | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> RunRecord:
@@ -106,6 +136,7 @@ class RunRecord:
             delivery_count=row.get("delivery_count") or 0,
             artifacts_published_at=row.get("artifacts_published_at"),
             input_set_id=_uuid("input_set_id"),
+            execution_metadata_json=row.get("execution_metadata_json"),
         )
 
     def public(self) -> dict[str, Any]:
@@ -150,6 +181,9 @@ class RunRecord:
             payload["heartbeat_at"] = self.heartbeat_at.isoformat()
         if self.error_json is not None:
             payload["failure"] = self.error_json
+        execution = public_execution_metadata(self.execution_metadata_json)
+        if execution:
+            payload["execution"] = execution
         return payload
 
 

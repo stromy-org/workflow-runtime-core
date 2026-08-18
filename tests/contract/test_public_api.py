@@ -48,6 +48,15 @@ def test_lifecycle_surface_is_exported() -> None:
         # implementation of "what a retry is" is how the schema forked.
         "RetryNotAllowed",
         "RetentionCandidate",
+        # ORG-PLAN-206 C5: the BYOK credential plane binds against all four.
+        # ``ScopedExecutionBinding`` and ``public_execution_metadata`` are the
+        # two a consumer CANNOT reimplement safely — one decides when a client's
+        # key is bound and unbound, the other decides what escapes to a client —
+        # so they belong to the shared surface for the same reason the rest does.
+        "ScopedExecutionBinding",
+        "ExecutionMetadataConflict",
+        "PUBLIC_EXECUTION_METADATA_KEYS",
+        "public_execution_metadata",
     ):
         assert symbol in workflow_runtime_core.__all__
 

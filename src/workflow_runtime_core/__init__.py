@@ -18,11 +18,12 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _metadata_version
 
-from .binding import ExecutionBinding, LeaseRenewer
+from .binding import ExecutionBinding, LeaseRenewer, ScopedExecutionBinding
 from .exceptions import (
     ActiveAttemptExists,
     CheckpointerError,
     DependencyError,
+    ExecutionMetadataConflict,
     LeaseLost,
     MigrationChecksumMismatch,
     MigrationError,
@@ -44,6 +45,7 @@ from .migrations import (
     verify_ledger,
 )
 from .models import (
+    PUBLIC_EXECUTION_METADATA_KEYS,
     TERMINAL_STATUS_VALUES,
     TERMINAL_STATUSES,
     RetentionCandidate,
@@ -51,6 +53,7 @@ from .models import (
     RunRecord,
     RunStatus,
     TerminalProjection,
+    public_execution_metadata,
     utcnow,
 )
 from .schema import (
@@ -73,6 +76,7 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 __all__: list[str] = [
     "CORE_NAMESPACE",
     "LATEST_VERSION",
+    "PUBLIC_EXECUTION_METADATA_KEYS",
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_MAX",
@@ -82,6 +86,7 @@ __all__: list[str] = [
     "CheckpointerError",
     "DependencyError",
     "ExecutionBinding",
+    "ExecutionMetadataConflict",
     "LeaseLost",
     "LeaseRenewer",
     "Migration",
@@ -94,6 +99,7 @@ __all__: list[str] = [
     "RunRecord",
     "RunStatus",
     "SchemaVersionMismatch",
+    "ScopedExecutionBinding",
     "StageFailure",
     "TerminalProjection",
     "WorkflowRuntimeCoreError",
@@ -101,6 +107,7 @@ __all__: list[str] = [
     "apply_app_migrations",
     "apply_migrations",
     "pending",
+    "public_execution_metadata",
     "read_app_version",
     "read_schema_version",
     "require_compatible_schema",
