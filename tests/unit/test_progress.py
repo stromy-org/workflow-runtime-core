@@ -37,8 +37,14 @@ class _Clock:
 class _Recorder(ProgressRecorder):
     """Captures writes instead of performing them."""
 
-    def __init__(self, *, interval: float = 15.0, raises: Exception | None = None) -> None:
-        super().__init__("run-1", min_interval_seconds=interval)
+    def __init__(
+        self,
+        *,
+        interval: float = 15.0,
+        raises: Exception | None = None,
+        nodes_completed: int = 0,
+    ) -> None:
+        super().__init__("run-1", min_interval_seconds=interval, nodes_completed=nodes_completed)
         self.writes: list[dict[str, Any]] = []
         self.raises = raises
 
@@ -86,6 +92,25 @@ def test_the_first_event_writes_immediately() -> None:
     assert len(rec.writes) == 1
     assert rec.writes[0]["node"] == "first"
     assert rec.writes[0]["nodes_completed"] == 1
+
+
+def test_a_resumed_run_continues_the_count_it_already_had() -> None:
+    """One run can span several containers; the count belongs to the run.
+
+    A paused run resumes in a fresh process, and a recorder that restarted at
+    zero made ``nodes_completed`` fall — 12 back to 1 — which anyone watching
+    reads as the run losing work it never lost.
+    """
+    rec = _Recorder(nodes_completed=12)
+    _observe(rec, {"review_questionnaire": {}})
+    assert rec.writes[0]["nodes_completed"] == 13
+
+
+def test_a_missing_or_nonsense_prior_count_starts_at_zero() -> None:
+    """A fresh run has nothing to continue from, and neither does a row whose
+    progress was never written — both are simply "start at zero"."""
+    assert _Recorder().nodes_completed == 0
+    assert _Recorder(nodes_completed=-5).nodes_completed == 0
 
 
 def test_a_burst_inside_the_window_writes_once() -> None:

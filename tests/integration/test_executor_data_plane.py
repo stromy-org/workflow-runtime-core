@@ -105,17 +105,21 @@ class _Binding:
         graph: _FakeGraph | None = None,
         *,
         fail_stage: str | None = None,
+        fail_exc: Exception | None = None,
         artifacts_published: bool = False,
         status: RunStatus = RunStatus.COMPLETED,
     ) -> None:
         self.graph = graph or _FakeGraph()
         self.fail_stage = fail_stage
+        #: Lets a test supply the exception itself, which is how a binding's own
+        #: ``retryable`` verdict gets into the runner in the first place.
+        self.fail_exc = fail_exc
         self.artifacts_published = artifacts_published
         self.status = status
 
     def _maybe_fail(self, stage: str) -> None:
         if self.fail_stage == stage:
-            raise RuntimeError(f"{stage} exploded")
+            raise self.fail_exc or RuntimeError(f"{stage} exploded")
 
     async def resolve_graph(self, workflow: str) -> Any:
         self._maybe_fail("resolve")
@@ -274,6 +278,54 @@ def test_a_publication_failure_leaves_the_run_failed_not_completed(blank_dsn: st
     assert after.error_json["stage"] == "artifacts"
     # Retryable: the graph output is on the durable workspace, so a retry
     # republishes rather than recomputing an expensive run.
+    assert after.error_json["retryable"] is True
+
+
+@pytest.mark.integration
+def test_a_binding_can_declare_a_failure_unretryable(blank_dsn: str) -> None:
+    """A deterministic failure must not be advertised as worth retrying.
+
+    ``retryable`` is not decoration: a client-facing surface reads it to decide
+    whether to offer "retry", and every failure claiming True meant offering a
+    guaranteed-identical rerun for things no rerun can change — a malformed
+    contract, a digest mismatch, an export the graph never produces. The binding
+    is the only layer that knows which is which, so its verdict has to survive
+    the wrapper the runner records through.
+    """
+
+    class _Deterministic(RuntimeError):
+        retryable = False
+
+    run = _claimed(blank_dsn)
+    binding = _Binding(fail_stage="publish", fail_exc=_Deterministic("nothing to publish"))
+    assert execute(run, binding, dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
+    assert after.error_json["retryable"] is False
+    # The stage and type labels are unaffected — this adds a verdict, it does
+    # not replace the diagnosis.
+    assert after.error_json["stage"] == "artifacts"
+    assert after.error_json["error_type"] == "_Deterministic"
+
+
+@pytest.mark.integration
+def test_an_unusable_retryable_attribute_falls_back_to_retryable(blank_dsn: str) -> None:
+    """Anything that is not a bool means "no verdict", not "do not retry".
+
+    The value lands in a JSON column a client reads, and the safe direction is
+    retryable: refusing to retry a transient failure strands a recoverable run,
+    while a needless retry only costs compute.
+    """
+
+    class _Confused(RuntimeError):
+        retryable = "no"  # e.g. a binding that stringified its own flag
+
+    run = _claimed(blank_dsn)
+    binding = _Binding(fail_stage="input", fail_exc=_Confused("bad flag"))
+    assert execute(run, binding, dsn=blank_dsn) == EXIT_FAILED
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
     assert after.error_json["retryable"] is True
 
 

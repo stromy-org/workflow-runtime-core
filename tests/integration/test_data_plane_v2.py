@@ -157,6 +157,73 @@ def test_expired_lease_requeues_and_allows_recovery_claim(blank_dsn: str) -> Non
 
 
 @pytest.mark.integration
+def test_a_crashed_run_is_reclaimed_without_an_operator(blank_dsn: str) -> None:
+    """A redelivered message reclaims a RUNNING row whose lease lapsed.
+
+    The recovery above works only because the test calls ``requeue_expired_lease``
+    itself. Nothing in a deployed consumer does — so a worker killed mid-run (OOM,
+    eviction, job timeout) left its row ``running`` with a dead lease, and the
+    redelivered message was rejected for not being ``queued``: the run was
+    stranded until a human noticed. Recovery has to happen on the claim path,
+    because that is the only path a redelivery actually takes.
+    """
+    _migrated(blank_dsn)
+    dispatch = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_dispatch(conn, run.run_id, dispatch)
+        registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="dead", lease_seconds=-1
+        )
+
+        recovered = registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="w2", lease_seconds=60
+        )
+        assert recovered is not None
+        assert recovered.lease_owner == "w2"
+        # Counted as a redelivery, so a run that crashes in a loop still reaches
+        # the consumer's max-deliveries ceiling instead of retrying forever.
+        assert recovered.delivery_count == 2
+
+        # And the reclaim is not a free-for-all: w2 now holds a LIVE lease, so a
+        # third delivery finds an owner that may still be working and backs off.
+        assert (
+            registry.claim_dispatch(
+                conn, run_id=run.run_id, dispatch_id=dispatch, owner="w3", lease_seconds=60
+            )
+            is None
+        )
+
+
+@pytest.mark.integration
+def test_a_stale_dispatch_cannot_reclaim_a_crashed_run(blank_dsn: str) -> None:
+    """The lapsed-lease path does not weaken the dispatch-identity guard.
+
+    Reclaim widens WHICH statuses are claimable; it must not widen which
+    MESSAGES may claim. A message from a prior enqueue of the same run stays
+    inert whether or not the current owner is alive.
+    """
+    _migrated(blank_dsn)
+    dispatch = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_dispatch(conn, run.run_id, dispatch)
+        registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="dead", lease_seconds=-1
+        )
+        assert (
+            registry.claim_dispatch(
+                conn,
+                run_id=run.run_id,
+                dispatch_id=str(uuid.uuid4()),
+                owner="impostor",
+                lease_seconds=60,
+            )
+            is None
+        )
+
+
+@pytest.mark.integration
 def test_one_live_attempt_per_workspace(blank_dsn: str) -> None:
     _migrated(blank_dsn)
     with registry.connect(blank_dsn) as conn:
