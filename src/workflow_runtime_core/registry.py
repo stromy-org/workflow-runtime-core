@@ -523,7 +523,12 @@ def claim_dispatch(
     The queue body is a REFERENCE, never the source of truth, so every guard
     lives here in one transaction:
 
-    * the row must exist and still be ``queued``;
+    * the row must exist and be claimable — ``queued``, or ``running`` with a
+      LAPSED lease. The second case is crash recovery: a worker that died mid-run
+      (OOM, node eviction, job timeout) left the row ``running`` forever, and
+      nothing else transitions it back. Requiring ``queued`` here made the
+      lease-expiry rule below unreachable for exactly the state it exists to
+      recover, so a crashed run was stranded until an operator noticed.
     * its ``dispatch_id`` must match the message — a stale message from a prior
       dispatch of the same run cannot start a second writer;
     * any existing lease must have expired — which is what makes crash recovery
@@ -531,8 +536,11 @@ def claim_dispatch(
       the dead worker's lease lapses, not merely because the queue made the
       message visible again.
 
-    Returning None is a normal outcome (the message is a duplicate, or another
-    worker won); the caller deletes the message and exits cleanly.
+    Returning None is a normal outcome (the message is a duplicate, another
+    worker won, or the original owner is still alive and holding its lease).
+    Only the first two mean the message is spent — see the caller, which must
+    distinguish "unclaimable forever" from "someone else still owns it" before
+    deleting anything.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM runs WHERE run_id = %s FOR UPDATE", (run_id,))
@@ -544,12 +552,15 @@ def claim_dispatch(
                 "claim_dispatch requires schema v2 (the workflow data plane); "
                 "the live registry is still v1. Run `wrc migrate` first."
             )
-        if row["status"] != RunStatus.QUEUED.value:
+        if row["status"] not in (RunStatus.QUEUED.value, RunStatus.RUNNING.value):
             return None
         if str(row["dispatch_id"]) != str(dispatch_id):
             return None
         lease_expires_at = row["lease_expires_at"]
         if lease_expires_at is not None and lease_expires_at > utcnow():
+            # A live owner. Checked for BOTH statuses on purpose: the guard that
+            # keeps two writers off one checkpoint thread is the lease, not the
+            # status, and `SELECT ... FOR UPDATE` above serialises the check.
             return None
         cur.execute(
             """
