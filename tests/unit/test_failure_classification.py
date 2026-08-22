@@ -101,6 +101,22 @@ def test_a_fresh_run_has_no_prior_count() -> None:
 
 
 @pytest.mark.unit
+def test_a_run_shaped_object_without_the_field_is_tolerated() -> None:
+    """Consumers drive ``execute`` with their own run-shaped objects.
+
+    Requiring a new attribute would break them on what is meant to be a safe
+    upgrade — which is exactly what happened to Stromy's own test double before
+    this read became defensive. A run that cannot say how far it got has not got
+    anywhere, as far as the counter is concerned.
+    """
+
+    class _MinimalRun:
+        run_id = "r1"
+
+    assert _nodes_completed_so_far(_MinimalRun()) == 0  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
 def test_a_resumed_run_continues_from_the_row() -> None:
     assert _nodes_completed_so_far(_run({"node": "review", "nodes_completed": 12})) == 12
 

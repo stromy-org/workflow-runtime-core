@@ -162,8 +162,13 @@ def _nodes_completed_so_far(run: RunRecord) -> int:
     writer (or a hand-edited row) may have shaped differently; anything that is
     not a non-negative int means "no usable prior count", which is exactly the
     fresh-run answer.
+
+    ``getattr`` rather than attribute access for the same reason this is a patch
+    release: a consumer may drive ``execute`` with its own run-shaped object, and
+    a new REQUIRED attribute would break it on upgrade. A run that cannot say how
+    far it got has not got anywhere as far as this is concerned.
     """
-    progress = run.progress_json
+    progress = getattr(run, "progress_json", None)
     if not isinstance(progress, dict):
         return 0
     completed = progress.get("nodes_completed")
