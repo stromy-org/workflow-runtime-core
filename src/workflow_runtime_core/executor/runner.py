@@ -140,6 +140,9 @@ class _StageError(Exception):
         super().__init__(f"{prefix}{cause}" if prefix else str(cause))
         self.stage = stage
         self.error_type = type(cause).__name__
+        # Carried, not re-derived: the wrapper is what reaches ``_record_failure``,
+        # so a verdict left on the cause would be dropped exactly where it matters.
+        self.retryable = _declared_retryable(cause)
 
 
 def _declared_stage(exc: BaseException, default: str) -> str:
@@ -150,6 +153,43 @@ def _declared_stage(exc: BaseException, default: str) -> str:
     """
     declared = getattr(exc, "stage", None)
     return declared if isinstance(declared, str) and declared else default
+
+
+def _nodes_completed_so_far(run: RunRecord) -> int:
+    """What a PRIOR container already counted for this run, or 0.
+
+    Read defensively from ``progress_json`` because it is a JSON column an older
+    writer (or a hand-edited row) may have shaped differently; anything that is
+    not a non-negative int means "no usable prior count", which is exactly the
+    fresh-run answer.
+    """
+    progress = run.progress_json
+    if not isinstance(progress, dict):
+        return 0
+    completed = progress.get("nodes_completed")
+    if isinstance(completed, bool) or not isinstance(completed, int):
+        return 0
+    return max(completed, 0)
+
+
+def _declared_retryable(exc: BaseException) -> bool:
+    """Whether retrying this failure could plausibly produce a different outcome.
+
+    Defaults to True — the safe direction, and what every consumer got before
+    bindings could say otherwise: retrying something deterministic wastes compute,
+    while refusing to retry something transient strands a recoverable run.
+
+    A binding marks the failures it KNOWS are deterministic (a malformed contract,
+    a digest mismatch, a declared export the graph never produces) by setting
+    ``retryable = False`` on the exception. That verdict is what a client-facing
+    surface reads to decide whether offering "retry" is honest — telling someone a
+    guaranteed-identical failure is worth another run is worse than saying nothing.
+
+    Read defensively for the same reason as :func:`_declared_stage`: the attribute
+    lands in a JSON column, so a non-bool must not pass through.
+    """
+    declared = getattr(exc, "retryable", None)
+    return declared if isinstance(declared, bool) else True
 
 
 async def _with_lease_renewal(
@@ -209,7 +249,10 @@ def execute(
 
     invoke_config = {"configurable": {"thread_id": run.thread_id, **config}}
     recorder = ProgressRecorder(
-        run.run_id, dsn=dsn, min_interval_seconds=progress_interval_seconds
+        run.run_id,
+        dsn=dsn,
+        min_interval_seconds=progress_interval_seconds,
+        nodes_completed=_nodes_completed_so_far(run),
     )
 
     async def _drive() -> tuple[str, Any]:
@@ -372,11 +415,14 @@ def _record_failure(run: RunRecord, exc: BaseException, *, dsn: str | None) -> i
                     "stage": stage,
                     "error_type": error_type,
                     "message": message[:2000],
-                    # Retryable by default: every stage the core can fail at
-                    # leaves the durable workspace and the checkpoint intact, so
-                    # a retry resumes rather than recomputing. A binding that
-                    # knows better says so by returning a FAILED projection.
-                    "retryable": True,
+                    # Retryable by DEFAULT, not unconditionally: every stage the
+                    # core can fail at leaves the durable workspace and the
+                    # checkpoint intact, so a retry resumes rather than
+                    # recomputing. But a binding that knows a failure is
+                    # deterministic says so on the exception, and that verdict
+                    # has to survive to here — a client told "retryable" about a
+                    # malformed contract will retry into the identical failure.
+                    "retryable": _declared_retryable(exc),
                     "correlation_id": correlation_id,
                 },
             )

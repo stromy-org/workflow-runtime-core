@@ -76,11 +76,17 @@ class ProgressRecorder:
         *,
         dsn: str | None = None,
         min_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
+        nodes_completed: int = 0,
     ) -> None:
         self.run_id = run_id
         self._dsn = dsn
         self._interval = max(min_interval_seconds, 0.0)
-        self._nodes_completed = 0
+        # Seeded, not zeroed, because ONE run can span several containers: an
+        # interrupted run resumes in a fresh process, and a recorder that restarts
+        # at zero makes ``nodes_completed`` fall — 12 back to 1 — which reads as
+        # the run losing work it never lost. The count is a property of the run,
+        # so it continues from whatever the row already records.
+        self._nodes_completed = max(nodes_completed, 0)
         self._last_node: str | None = None
         self._last_write: float | None = None
         self._unwritten = False
