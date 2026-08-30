@@ -22,7 +22,36 @@ permissions:
   contents: write
 
 jobs:
+  # Refuse to publish a tag that is not reachable from main (ORG-PLAN-209).
+  #
+  # `verify tag matches pyproject version` proves the tag is *self-consistent*, not
+  # that its commit was ever reviewed or CI-gated: `git tag v9.9.9` on a side branch
+  # with a matching pyproject bump passes it and publishes. Consumers pin exact tags
+  # via [tool.uv.sources], so a tag is the immutable artifact — it cannot be walked
+  # back once a consumer has resolved it.
+  #
+  # This is its own JOB, not a step, so every downstream job (build, GitHub Release,
+  # consumer-bump dispatch) is gated by `needs:` and no release side effect can run
+  # ahead of it. `fetch-depth: 0` is load-bearing — ancestry is unprovable on the
+  # default shallow checkout, and a shallow `merge-base` would fail open-ish/noisily
+  # rather than answer the question.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refuse a tag that is not reachable from main
+        run: |
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of origin/main."
+            echo "::error::Merge the work to main before tagging — a release must ship reviewed, CI-gated code."
+            exit 1
+          fi
+
   build-and-release:
+    needs: [guard]
     runs-on: ubuntu-latest
     env:
       # The `secrets` context is NOT available in a step-level `if:` — using it
