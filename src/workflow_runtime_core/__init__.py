@@ -18,20 +18,40 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _metadata_version
 
+from .auth import (
+    AuthConfigurationError,
+    AuthMode,
+    CheckpointSetupMode,
+    CredentialSource,
+    describe_session,
+    resolve_application_role,
+    resolve_auth_mode,
+    resolve_checkpoint_setup,
+    resolve_owner_role,
+    validate_identifier,
+)
 from .binding import ExecutionBinding, LeaseRenewer, ScopedExecutionBinding
 from .exceptions import (
     ActiveAttemptExists,
     CheckpointerError,
+    CheckpointStoreOutdated,
     DependencyError,
     ExecutionMetadataConflict,
     LeaseLost,
     MigrationChecksumMismatch,
     MigrationError,
+    MigrationRoleRequired,
     RegistryError,
     RetryNotAllowed,
     SchemaVersionMismatch,
     StageFailure,
     WorkflowRuntimeCoreError,
+)
+from .grants import (
+    CHECKPOINT_MANIFEST,
+    CORE_MANIFEST,
+    GrantManifest,
+    missing_privileges,
 )
 from .migrations import (
     CORE_NAMESPACE,
@@ -40,6 +60,7 @@ from .migrations import (
     Migration,
     apply_app_migrations,
     apply_migrations,
+    assert_may_migrate,
     pending,
     read_app_version,
     verify_ledger,
@@ -74,6 +95,8 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0.0.0.dev0"
 
 __all__: list[str] = [
+    "CHECKPOINT_MANIFEST",
+    "CORE_MANIFEST",
     "CORE_NAMESPACE",
     "LATEST_VERSION",
     "PUBLIC_EXECUTION_METADATA_KEYS",
@@ -83,15 +106,22 @@ __all__: list[str] = [
     "SUPPORTED_SCHEMA_MIN",
     "TERMINAL_STATUSES",
     "TERMINAL_STATUS_VALUES",
+    "AuthConfigurationError",
+    "AuthMode",
+    "CheckpointSetupMode",
+    "CheckpointStoreOutdated",
     "CheckpointerError",
+    "CredentialSource",
     "DependencyError",
     "ExecutionBinding",
+    "GrantManifest",
     "ExecutionMetadataConflict",
     "LeaseLost",
     "LeaseRenewer",
     "Migration",
     "MigrationChecksumMismatch",
     "MigrationError",
+    "MigrationRoleRequired",
     "RegistryError",
     "RetentionCandidate",
     "RetryNotAllowed",
@@ -106,11 +136,19 @@ __all__: list[str] = [
     "ActiveAttemptExists",
     "apply_app_migrations",
     "apply_migrations",
+    "assert_may_migrate",
+    "describe_session",
+    "missing_privileges",
     "pending",
     "public_execution_metadata",
     "read_app_version",
     "read_schema_version",
     "require_compatible_schema",
+    "resolve_application_role",
+    "resolve_auth_mode",
+    "resolve_checkpoint_setup",
+    "resolve_owner_role",
     "utcnow",
+    "validate_identifier",
     "verify_ledger",
 ]

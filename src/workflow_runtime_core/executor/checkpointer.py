@@ -35,7 +35,7 @@ from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
-from ..exceptions import CheckpointerError, RegistryError
+from ..exceptions import CheckpointerError, CheckpointStoreOutdated, RegistryError
 from ..registry import dsn_from_env
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -187,18 +187,157 @@ def _missing_postgres_saver() -> CheckpointerError:
     )
 
 
+# ── setup() is a MIGRATION, and a DML-only runtime must not call it ──────────
+#
+# ``saver.setup()`` runs schema SQL. It is written to be idempotent, and it is —
+# but idempotent is not the same as harmless: it still issues DDL, so a runtime
+# holding only DML dies at startup with a privilege error rather than the
+# actionable "your deployment skipped a step" this raises instead. Worse, if the
+# runtime DID hold the privilege, one replica could migrate the checkpoint store
+# while its siblings are mid-read of it.
+#
+# So the store's schema becomes a deployment step (`wrc checkpoint-setup`, run by
+# the migration operator) and the runtime only VERIFIES. `run` remains the
+# default, because every consumer before 0.8.0 connects as the object owner and
+# nothing about their deployment changed.
+
+#: The tables LangGraph's saver creates, and the ledger it records its own
+#: schema version in. Read-only here; the authoritative list for GRANT purposes
+#: is :data:`workflow_runtime_core.grants.CHECKPOINT_MANIFEST`.
+_CHECKPOINT_LEDGER = "checkpoint_migrations"
+
+
+def expected_checkpoint_version(saver: object) -> int | None:
+    """Highest ``checkpoint_migrations.v`` a fully-migrated store reaches.
+
+    Read off the saver's own ``MIGRATIONS`` list rather than pinned here: that
+    list IS the schema definition, so a hardcoded expectation would need editing
+    on every langgraph upgrade and would be silently wrong until someone did.
+    The recorded version is the last INDEX, hence ``len - 1``.
+    """
+    migrations = getattr(saver, "MIGRATIONS", None)
+    return len(migrations) - 1 if migrations else None
+
+
+def _interpret_checkpoint_state(exists: bool, live: int | None, expected: int | None) -> None:
+    """Raise :class:`CheckpointStoreOutdated` unless the store is current.
+
+    Split out from the two I/O paths so the sync and async verifiers cannot
+    drift into disagreeing about what "current" means.
+    """
+    if not exists:
+        raise CheckpointStoreOutdated(
+            f"the checkpoint store has never been created (no {_CHECKPOINT_LEDGER} table)."
+        )
+    if expected is not None and (live is None or live < expected):
+        raise CheckpointStoreOutdated(
+            f"the checkpoint store is at v{live} but this langgraph build expects v{expected}."
+        )
+
+
+def _first_value(row: object) -> object:
+    """First column of a row from either a tuple or a dict row factory."""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()), None)
+    return row[0]  # type: ignore[index]
+
+
+def _verify_checkpoint_store(saver: object) -> None:
+    """Assert the checkpoint store exists and is current. Never migrates."""
+    conn = saver.conn  # type: ignore[attr-defined]
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f"public.{_CHECKPOINT_LEDGER}",))
+        exists = _first_value(cur.fetchone()) is not None
+        live: int | None = None
+        if exists:
+            cur.execute(f"SELECT max(v) FROM {_CHECKPOINT_LEDGER}")  # noqa: S608 - module constant
+            value = _first_value(cur.fetchone())
+            live = int(value) if isinstance(value, int) else None
+    _interpret_checkpoint_state(exists, live, expected_checkpoint_version(saver))
+
+
+async def _averify_checkpoint_store(saver: object) -> None:
+    """Async twin of :func:`_verify_checkpoint_store`."""
+    conn = saver.conn  # type: ignore[attr-defined]
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT to_regclass(%s)", (f"public.{_CHECKPOINT_LEDGER}",))
+        exists = _first_value(await cur.fetchone()) is not None
+        live: int | None = None
+        if exists:
+            await cur.execute(f"SELECT max(v) FROM {_CHECKPOINT_LEDGER}")  # noqa: S608 - module constant
+            value = _first_value(await cur.fetchone())
+            live = int(value) if isinstance(value, int) else None
+    _interpret_checkpoint_state(exists, live, expected_checkpoint_version(saver))
+
+
+# ── Opening the saver's connection ──────────────────────────────────────────
+#
+# LangGraph's own ``from_conn_string`` hardcodes ``psycopg.Connection`` /
+# ``AsyncConnection``, so under Entra auth it would open a password connection
+# with no password and fail. These wrappers reproduce its connection options
+# EXACTLY — autocommit, prepare_threshold=0, dict_row, all three load-bearing to
+# the saver — and vary only the connection class and the credential.
+#
+# The options are copied deliberately rather than referenced, because langgraph
+# does not export them; the integration test that opens a real saver through
+# this path is what would catch an upstream change to any of the three.
+_SAVER_CONNECT_KWARGS = {"autocommit": True, "prepare_threshold": 0}
+
+
 @contextmanager
-def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
-    """Yield a set-up ``PostgresSaver`` bound to one shared connection.
+def _saver_session(saver_cls: object, dsn: str) -> Generator[PostgresSaver]:
+    """Open a sync saver on a connection built for the configured auth mode."""
+    from psycopg.rows import dict_row
+
+    from ..auth import connection_class, connection_kwargs, resolve_auth_mode
+
+    mode = resolve_auth_mode()
+    cls = connection_class(mode, is_async=False)
+    with cls.connect(
+        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **connection_kwargs(mode, is_async=False)
+    ) as conn:
+        yield saver_cls(conn)  # type: ignore[operator]
+
+
+@asynccontextmanager
+async def _asaver_session(saver_cls: object, dsn: str) -> AsyncGenerator[AsyncPostgresSaver]:
+    """Open an async saver on a connection built for the configured auth mode."""
+    from psycopg.rows import dict_row
+
+    from ..auth import connection_class, connection_kwargs, resolve_auth_mode
+
+    mode = resolve_auth_mode()
+    cls = connection_class(mode, is_async=True)
+    async with await cls.connect(
+        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **connection_kwargs(mode, is_async=True)
+    ) as conn:
+        yield saver_cls(conn=conn)  # type: ignore[operator]
+
+
+@contextmanager
+def checkpointer(dsn: str | None = None, *, setup: str | None = None) -> Generator[PostgresSaver]:
+    """Yield a ``PostgresSaver`` bound to one shared connection.
 
     Job-per-run means one process, one run — so one connection is the right
     shape, and it keeps the per-run connection cost at exactly 1 (the constraint
     that decides when the shared Postgres needs resizing).
 
+    ``setup`` resolves explicit argument -> ``WRC_CHECKPOINT_SETUP`` -> ``run``.
+    ``run`` calls the saver's ``setup()`` (schema SQL, tolerating the
+    first-use race below); ``verify`` only asserts the store is present and
+    current, and raises :class:`CheckpointStoreOutdated` if it is not. The
+    default keeps every pre-0.8.0 caller byte-identical; a DML-only runtime opts
+    into ``verify``.
+
     The ``opened`` flag is load-bearing, not defensive (see
     :func:`acheckpointer` for the failure it prevents).
     """
+    from ..auth import CheckpointSetupMode, resolve_checkpoint_setup
+
     enforce_strict_msgpack()
+    mode = resolve_checkpoint_setup(setup)
 
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
@@ -208,8 +347,11 @@ def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
     resolved = dsn or dsn_from_env()
     opened = False
     try:
-        with PostgresSaver.from_conn_string(resolved) as saver:
-            _setup_tolerating_races(saver)
+        with _saver_session(PostgresSaver, resolved) as saver:
+            if mode is CheckpointSetupMode.RUN:
+                _setup_tolerating_races(saver)
+            else:
+                _verify_checkpoint_store(saver)
             opened = True
             yield saver
     except (CheckpointerError, RegistryError):
@@ -221,8 +363,10 @@ def checkpointer(dsn: str | None = None) -> Generator[PostgresSaver]:
 
 
 @asynccontextmanager
-async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresSaver]:
-    """Yield a set-up ``AsyncPostgresSaver`` bound to one shared connection.
+async def acheckpointer(
+    dsn: str | None = None, *, setup: str | None = None
+) -> AsyncGenerator[AsyncPostgresSaver]:
+    """Yield an ``AsyncPostgresSaver`` bound to one shared connection.
 
     The runtime path (see module docstring): hosted graphs are async, so the
     runner drives them via ``astream``, whose async Pregel loop requires a saver
@@ -240,8 +384,14 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
     would have written a terminal status over the outcome of whichever runner
     actually held the lease. Only failures raised *before* the first successful
     yield are store-open failures.
+
+    ``setup`` behaves exactly as in :func:`checkpointer`. This is the path the
+    hosted runtime takes, so it is the one that runs ``verify``.
     """
+    from ..auth import CheckpointSetupMode, resolve_checkpoint_setup
+
     enforce_strict_msgpack()
+    mode = resolve_checkpoint_setup(setup)
 
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -251,8 +401,11 @@ async def acheckpointer(dsn: str | None = None) -> AsyncGenerator[AsyncPostgresS
     resolved = dsn or dsn_from_env()
     opened = False
     try:
-        async with AsyncPostgresSaver.from_conn_string(resolved) as saver:
-            await _asetup_tolerating_races(saver)
+        async with _asaver_session(AsyncPostgresSaver, resolved) as saver:
+            if mode is CheckpointSetupMode.RUN:
+                await _asetup_tolerating_races(saver)
+            else:
+                await _averify_checkpoint_store(saver)
             opened = True
             yield saver
     except (CheckpointerError, RegistryError):

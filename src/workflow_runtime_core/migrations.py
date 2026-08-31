@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .exceptions import MigrationChecksumMismatch, MigrationError
+from .exceptions import MigrationChecksumMismatch, MigrationError, MigrationRoleRequired
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .registry import DbConnection
@@ -531,15 +531,69 @@ def verify_ledger(
                 )
 
 
+def assert_may_migrate(conn: DbConnection, *, owner_role: str | None) -> None:
+    """Prove this session can actually migrate — BEFORE reading the ledger.
+
+    The ordering is the entire point, and it closes a hole that a lazy check
+    leaves wide open: the application role almost always finds the ledger
+    ALREADY CURRENT, so a migration command that only discovers its lack of
+    privilege when it tries to write takes the "nothing to do" path instead and
+    exits 0. The release then looks migrated when nothing ran, and the next one
+    inherits a schema nobody moved.
+
+    Two proofs, because a deployment may use either shape:
+
+    * with ``owner_role``, ``SET LOCAL ROLE`` — an application principal is not
+      a member and fails here, loudly, as ``MigrationRoleRequired``;
+    * always, INSERT on the ledger (or CREATE on the schema when the ledger does
+      not exist yet, which is a fresh database about to get one). This catches
+      the deployment that separated privileges WITHOUT naming an owner role,
+      where the elevation check has nothing to test.
+
+    A consumer that migrates as the object owner — every pre-0.8.0 caller —
+    passes both trivially.
+    """
+    from .auth import can_write_table, scalar, set_role
+
+    if owner_role is not None:
+        set_role(conn, owner_role)
+
+    if ledger_exists(conn):
+        if not can_write_table(conn, "schema_migrations"):
+            raise MigrationRoleRequired(
+                owner_role or "<the migration owner>",
+                "the connected principal holds no INSERT on schema_migrations, so it "
+                "cannot record a migration. Refusing before reading the ledger: a "
+                "current ledger would otherwise let this exit 0 having migrated nothing",
+            )
+        return
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT has_schema_privilege('public', 'CREATE')")
+        can_create = bool(scalar(cur.fetchone()))
+    if not can_create:
+        raise MigrationRoleRequired(
+            owner_role or "<the migration owner>",
+            "there is no migration ledger yet and the connected principal cannot "
+            "CREATE in schema public, so it cannot create one",
+        )
+
+
 def apply_migrations(
     conn: DbConnection,
     *,
     target: int | None = None,
+    owner_role: str | None = None,
 ) -> int:
     """Apply every pending migration up to ``target`` under an advisory lock.
 
     Returns the resulting schema version. Idempotent: on an already-current
     database nothing is executed and the live version is returned unchanged.
+
+    ``owner_role`` elevates the session with ``SET LOCAL ROLE`` before anything
+    is read, so objects created here are owned by that role rather than by
+    whichever login happened to run the migration. ``None`` — the default, and
+    every caller before 0.8.0 — keeps the original behaviour exactly.
 
     The advisory lock is transaction-scoped (``pg_advisory_xact_lock``) so it is
     released by COMMIT or ROLLBACK — a migrator killed mid-run cannot leave the
@@ -558,6 +612,10 @@ def apply_migrations(
         # Serialise concurrent migrators. Whoever loses the race blocks here and
         # then observes the winner's committed version, so it applies nothing.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_ADVISORY_LOCK_ID,))
+
+        # Elevation and the privilege proof come BEFORE the ledger read. See
+        # assert_may_migrate for the no-op-success hole this closes.
+        assert_may_migrate(conn, owner_role=owner_role)
 
         live = read_schema_version(conn)
         if live is not None and live > LATEST_VERSION:
@@ -639,6 +697,8 @@ def apply_app_migrations(
     conn: DbConnection,
     namespace: str,
     migrations: tuple[Migration, ...],
+    *,
+    owner_role: str | None = None,
 ) -> int:
     """Apply an application-owned additive chain under its own ledger namespace.
 
@@ -669,6 +729,11 @@ def apply_app_migrations(
 
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_ADVISORY_LOCK_ID,))
+
+        # Same ordering rule as the core chain: elevate and prove the privilege
+        # before reading anything, so an application principal cannot reach the
+        # "already at vN, nothing to do" path and exit 0.
+        assert_may_migrate(conn, owner_role=owner_role)
 
         verify_ledger(conn, namespace=namespace, migrations=migrations)
 
