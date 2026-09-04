@@ -169,10 +169,13 @@ def _nodes_completed_so_far(run: RunRecord) -> int:
     a new REQUIRED attribute would break it on upgrade. A run that cannot say how
     far it got has not got anywhere as far as this is concerned.
     """
-    progress = getattr(run, "progress_json", None)
-    if not isinstance(progress, dict):
+    raw: object = getattr(run, "progress_json", None)
+    if not isinstance(raw, dict):
         return 0
-    completed = progress.get("nodes_completed")
+    # `getattr` on an arbitrary object is `Any`, and narrowing `object` with
+    # `isinstance(..., dict)` still leaves the parameters unknown — so name the
+    # shape once here rather than letting `Unknown` leak into `completed`.
+    completed = cast("dict[str, object]", raw).get("nodes_completed")
     if isinstance(completed, bool) or not isinstance(completed, int):
         return 0
     return max(completed, 0)
