@@ -89,6 +89,27 @@ def test_a_retry_keeps_the_workspace_and_takes_a_new_thread(blank_dsn: str) -> N
 
 
 @pytest.mark.integration
+def test_the_public_projection_carries_the_lineage_a_caller_can_see(blank_dsn: str) -> None:
+    """The record-level lineage above is worthless to a caller who cannot SEE it.
+
+    A retry mints a new ``run_id``, so a client holding only run ids has two
+    unrelated-looking runs and no way to tell attempt 2 is the same job. The
+    workspace is the stable half of the pair, and it has to survive the projection
+    for the distinction to reach anyone.
+    """
+    _migrated(blank_dsn)
+    parent = _failed_run(blank_dsn)
+
+    with registry.connect(blank_dsn) as conn:
+        attempt = registry.create_retry(conn, run_id=parent.run_id)
+
+    before, after = parent.public(), attempt.public()
+    assert after["workspace_id"] == before["workspace_id"]
+    assert after["run_id"] != before["run_id"]
+    assert after["attempt"] == {"attempt_no": 2, "retry_of": before["run_id"]}
+
+
+@pytest.mark.integration
 def test_the_parents_event_trail_names_its_retry(blank_dsn: str) -> None:
     """An operator looking at a failed run must be able to see it was retried
     without going hunting for a child row."""

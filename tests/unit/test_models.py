@@ -132,9 +132,25 @@ def test_public_omits_the_data_plane_keys_on_a_v1_row() -> None:
 @pytest.mark.unit
 def test_public_exposes_the_data_plane_keys_on_a_v2_row() -> None:
     payload = RunRecord.from_row(_v2_row()).public()
+    assert payload["workspace_id"] == "22222222-2222-2222-2222-222222222222"
     assert payload["attempt"] == {"attempt_no": 1, "retry_of": None}
     assert payload["progress"]["current_node"] == "scoring"
     assert payload["heartbeat_at"] == _NOW.isoformat()
+
+
+@pytest.mark.unit
+def test_public_names_the_workspace_rather_than_leaving_a_bare_uuid() -> None:
+    """The caller's only handle on the run folder, and it must be LABELLED.
+
+    Withholding it never hid the value — absolute paths in workflow state carry it
+    out through ``interrupt_payload`` regardless. It just left a second UUID with
+    no name beside identifiers that are all ``run_id``, which is how run 4f18ec95
+    got reported at a confidently wrong location on 2026-08-31.
+    """
+    payload = RunRecord.from_row(_v2_row()).public()
+    assert payload["workspace_id"] != payload["run_id"]
+    # A v1 row has no data plane, so it must not claim a workspace either.
+    assert "workspace_id" not in RunRecord.from_row(_row()).public()
 
 
 @pytest.mark.unit
