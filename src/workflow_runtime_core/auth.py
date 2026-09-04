@@ -45,9 +45,12 @@ from __future__ import annotations
 import os
 import re
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .exceptions import RegistryError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
 
 # --- environment contract ----------------------------------------------------
 
@@ -117,11 +120,15 @@ class AuthConfigurationError(RegistryError):
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,62}$")
 
 
-def validate_identifier(value: str, *, what: str) -> str:
+def validate_identifier(value: object, *, what: str) -> str:
     """Return ``value`` if it is a safe SQL identifier, else raise.
 
     ``what`` names the setting in the error, so an operator who typo'd
     ``--owner-role`` is told which flag to fix rather than being shown a regex.
+
+    The parameter is ``object``, not ``str``: these values arrive from the
+    environment and from callers this library does not type-check, so the
+    ``isinstance`` guard is a real runtime check rather than a redundant one.
     """
     if not isinstance(value, str) or not _IDENTIFIER_RE.match(value):
         raise AuthConfigurationError(
@@ -304,13 +311,19 @@ def describe_session(conn: Any) -> dict[str, Any]:
     dict's KEYS and produces ``{"current_user": "current_user", ...}`` — a
     report that looks structurally fine and says nothing.
     """
+    cur: Any
     with conn.cursor() as cur:
         cur.execute(PROBE_SQL)
-        columns = [d.name for d in cur.description or []]
-        row = cur.fetchone()
+        # `cur.description` is Any and `Any or []` widens to `Any | list[Unknown]`,
+        # so pin the sequence before iterating it.
+        description: Sequence[Any] = cur.description or []
+        columns: list[str] = [str(d.name) for d in description]
+        row: Any = cur.fetchone()
     if row is None:  # pragma: no cover - would mean the catalog broke
         raise RegistryError("auth probe returned no row")
-    return dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
+    if isinstance(row, dict):
+        return dict(cast("dict[str, Any]", row))
+    return dict(zip(columns, cast("Sequence[Any]", row), strict=True))
 
 
 def scalar(row: Any) -> Any:
@@ -324,8 +337,8 @@ def scalar(row: Any) -> Any:
     if row is None:
         return None
     if isinstance(row, dict):
-        return next(iter(row.values()), None)
-    return row[0]
+        return next(iter(cast("dict[str, Any]", row).values()), None)
+    return cast("Sequence[Any]", row)[0]
 
 
 def can_write_table(conn: Any, table: str) -> bool:
