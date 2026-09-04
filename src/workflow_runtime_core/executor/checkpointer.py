@@ -33,12 +33,14 @@ import os
 import sys
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from ..exceptions import CheckpointerError, CheckpointStoreOutdated, RegistryError
 from ..registry import dsn_from_env
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
     from langgraph.checkpoint.postgres import PostgresSaver
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -240,13 +242,14 @@ def _first_value(row: object) -> object:
     if row is None:
         return None
     if isinstance(row, dict):
-        return next(iter(row.values()), None)
-    return row[0]  # type: ignore[index]
+        return next(iter(cast("dict[str, object]", row).values()), None)
+    return cast("Sequence[object]", row)[0]
 
 
 def _verify_checkpoint_store(saver: object) -> None:
     """Assert the checkpoint store exists and is current. Never migrates."""
-    conn = saver.conn  # type: ignore[attr-defined]
+    conn: Any = cast("Any", saver).conn
+    cur: Any
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", (f"public.{_CHECKPOINT_LEDGER}",))
         exists = _first_value(cur.fetchone()) is not None
@@ -260,7 +263,8 @@ def _verify_checkpoint_store(saver: object) -> None:
 
 async def _averify_checkpoint_store(saver: object) -> None:
     """Async twin of :func:`_verify_checkpoint_store`."""
-    conn = saver.conn  # type: ignore[attr-defined]
+    conn: Any = cast("Any", saver).conn
+    cur: Any
     async with conn.cursor() as cur:
         await cur.execute("SELECT to_regclass(%s)", (f"public.{_CHECKPOINT_LEDGER}",))
         exists = _first_value(await cur.fetchone()) is not None
