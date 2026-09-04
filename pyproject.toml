@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workflow-runtime-core"
-version = "0.7.2"
+version = "0.8.0"
 description = "Client-neutral durable workflow lifecycle: versioned run registry, explicit migrations, execution bindings, leases and transactional outbox"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,19 @@ executor = [
 rabbitmq = [
     "aio-pika>=9.4,<10",
 ]
+# Passwordless PostgreSQL via Microsoft Entra tokens (ORG-PLAN-226). OPT-IN and
+# additive: WRC_PG_AUTH defaults to `password`, so a consumer that installs this
+# version and changes nothing keeps the exact connection behaviour it had, and
+# the base install stays free of any Azure dependency. Only a deployment that
+# actually authenticates with managed identity installs this.
+#
+# azure-postgresql-auth ships the psycopg 3 connection classes that acquire a
+# token per connection; azure-identity supplies the credential objects. Both are
+# needed — the adapter REQUIRES a credential argument and constructs none itself.
+azure-postgres = [
+    "azure-postgresql-auth[psycopg3]>=1.0.2,<2",
+    "azure-identity>=1,<2",
+]
 # Fault-injection + real-broker/database fixtures for consumers reusing our harness.
 # RabbitMQ is in here, not just postgres: the delivery guarantees (unroutable
 # returns, redelivery of an unacknowledged message) are statements about the
@@ -45,7 +58,7 @@ test = [
     "pytest-asyncio>=0.23",
     "testcontainers[postgres,rabbitmq]>=4.8.0",
 ]
-all = ["workflow-runtime-core[executor,rabbitmq,test]"]
+all = ["workflow-runtime-core[executor,rabbitmq,azure-postgres,test]"]
 
 # PEP 735 dependency-groups — installed by default with `uv sync` (no --extra needed).
 [dependency-groups]

@@ -35,12 +35,34 @@ they now carry none.
 src/workflow_runtime_core/
   models.py       RunStatus · RunRecord · TerminalProjection      (base)
   registry.py     connection + ALL run DML, no DDL                (base)
+  auth.py         auth mode, credential source, role validation    (base)
+  grants.py       per-chain privilege manifests                    (base)
   migrations.py   numbered migrations + advisory-locked applier    (base)
   schema.py       read/require the live version — never writes     (base)
   binding.py      the ExecutionBinding protocol                    (base)
-  cli.py          `wrc migrate | status | list-migrations`         (base)
+  cli.py          `wrc migrate | status | list-migrations |        (base)
+                   checkpoint-setup | auth-probe`
   executor/       checkpointer + runner                        (executor extra)
 ```
+
+### Database authentication (0.8.0, opt-in)
+
+`WRC_PG_AUTH` defaults to `password`, so a consumer that upgrades and changes
+nothing keeps the connection behaviour it had, and the base install stays free of
+Azure dependencies. `entra` needs the `azure-postgres` extra and acquires a token
+per connection.
+
+| Setting | Values | Default | Notes |
+|---|---|---|---|
+| `WRC_PG_AUTH` | `password`, `entra` | `password` | selects the connection class |
+| `WRC_PG_CREDENTIAL` | `managed-identity`, `azure-cli` | **none** | unset is an error, never a guess |
+| `WRC_PG_OWNER_ROLE` / `--owner-role` | SQL identifier | unset | `SET ROLE` before migrating |
+| `WRC_PG_APPLICATION_ROLE` / `--application-role` | SQL identifier | unset | chain grants reconciled for it |
+| `WRC_CHECKPOINT_SETUP` | `run`, `verify` | `run` | `verify` refuses to migrate |
+
+`WRC_PG_CREDENTIAL` has no default deliberately: `DefaultAzureCredential` succeeds
+with whichever source answers first, which makes the database identity a property
+of the ambient environment rather than of the deployment.
 
 **Dependency direction is one-way and load-bearing.** The base package imports only
 `psycopg` + `click`; `executor/` may import LangGraph; nothing imports a consumer.
@@ -68,6 +90,27 @@ this package without acquiring a graph engine.
    caller.
 6. **Bind the checkpointer by attribute copy, never `with_config(checkpointer=...)`** —
    the latter is silently accepted and yields a graph with NO durability.
+7. **A migration command proves its privilege BEFORE reading the ledger.** The
+   application role almost always finds the ledger already current, so a lazy check
+   takes the "nothing to do" path and exits 0 — reporting a migration nobody could
+   have performed. `assert_may_migrate()` runs first and raises
+   `MigrationRoleRequired`.
+8. **Role names are ARGUMENTS, never constants.** This package is consumed by an
+   estate whose roles it must not encode and by generated services that have none.
+   `auth.validate_identifier()` refuses anything needing quoting rather than
+   escaping it — these strings reach `SET ROLE` and `GRANT`, which take no
+   parameters.
+9. **No `GRANT ... ON ALL TABLES`, and no `ALTER DEFAULT PRIVILEGES`.** `ON ALL
+   TABLES` is a snapshot that reads like a rule and sweeps the migration ledgers in
+   with it; default privileges are a rule that is not retroactive and applies per
+   creating role. `grants.py` names every object, so a new table is *inaccessible*
+   until its chain classifies it operational or ledger — a loud failure, which is
+   the one to want.
+10. **`checkpoint-setup` runs under autocommit with a session-level `SET ROLE`.**
+    LangGraph's `setup()` issues `CREATE INDEX CONCURRENTLY`, which PostgreSQL
+    refuses inside a transaction block, so `SET LOCAL ROLE` would apply to a
+    transaction ending with the statement itself. Elevation must precede `setup()`
+    or the tables end up owned by the operator's login.
 
 ## Public API
 

@@ -122,6 +122,53 @@ class MigrationChecksumMismatch(MigrationError):
     """
 
 
+class MigrationRoleRequired(MigrationError):
+    """The connected principal could not assume the migration owner role.
+
+    Raised BEFORE the ledger is read, and that ordering is the whole point. The
+    application role usually finds the ledger already current, so a migration
+    command that checked privileges lazily would take the "nothing to do" path
+    and exit 0 — reporting success for an operation it was never able to
+    perform. The next release then appears to have migrated when nothing did.
+
+    Recovering means connecting as a principal that holds the migration
+    capability, not weakening the role: an application that can migrate is the
+    condition this separation exists to remove.
+    """
+
+    def __init__(self, role: str, detail: str) -> None:
+        super().__init__(
+            f"cannot assume the migration owner role {role!r}: {detail}. "
+            f"Migrations run as an operator holding the migration capability, never "
+            f"as the application role — connect with a principal that may SET ROLE "
+            f"{role!r}."
+        )
+        self.role = role
+        self.detail = detail
+
+
+class CheckpointStoreOutdated(CheckpointerError):
+    """The checkpoint store needs a migration this process may not apply.
+
+    The runtime opens the checkpointer in ``verify`` mode, so a store that is
+    absent or behind is a deployment step that has not happened — not something
+    to fix in-process. Applying it here would mean the application issuing DDL,
+    which is exactly the privilege this separation removes, and it would let one
+    replica migrate a store its siblings are mid-read of.
+
+    Raised before any work is claimed, so a run fails fast rather than pausing
+    into a store that cannot record it.
+    """
+
+    def __init__(self, detail: str, *, command: str = "wrc checkpoint-setup") -> None:
+        super().__init__(
+            f"{detail} Run `{command}` as the migration operator before starting the "
+            f"runtime; applications never migrate their own checkpoint store."
+        )
+        self.detail = detail
+        self.command = command
+
+
 class DependencyError(WorkflowRuntimeCoreError, ImportError):
     """An optional dependency is missing.
 

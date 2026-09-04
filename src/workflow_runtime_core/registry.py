@@ -77,24 +77,72 @@ def dsn_from_env(env_var: str = _DSN_ENV) -> str:
 
 
 @contextmanager
-def connect(dsn: str | None = None) -> Generator[DbConnection]:
-    """Open a registry connection. Commits on clean exit, rolls back on error."""
+def connect(
+    dsn: str | None = None, *, auth: str | None = None, autocommit: bool = False
+) -> Generator[DbConnection]:
+    """Open a registry connection. Commits on clean exit, rolls back on error.
+
+    ``autocommit=True`` opts out of that wrapper, and exactly one caller needs
+    it: ``wrc checkpoint-setup``. LangGraph's ``setup()`` issues ``CREATE INDEX
+    CONCURRENTLY``, which PostgreSQL refuses inside a transaction block — and
+    CIC is also why the checkpointer tolerates its first-use race instead of
+    taking an advisory lock (see that module). An autocommit session is
+    therefore not a convenience here; it is the only way the statement can run
+    at all. Note the consequence for elevation: ``SET LOCAL ROLE`` is scoped to
+    a transaction and evaporates immediately under autocommit, so that path uses
+    a session-level ``SET ROLE`` and resets it when done.
+
+    ``auth`` selects the authentication implementation and defaults to
+    ``WRC_PG_AUTH``, which itself defaults to ``password`` — so a caller that
+    passes nothing gets exactly the connection it got before this parameter
+    existed. Under ``entra`` the DSN carries a principal name and no password,
+    and a token is acquired per connection from the credential named by
+    ``WRC_PG_CREDENTIAL``.
+
+    One factory serves the registry, the migration commands and the checkpointer
+    (via :mod:`workflow_runtime_core.executor.checkpointer`). That is deliberate:
+    when the registry and the checkpoint store each resolved their own
+    connection, the two could authenticate as different principals in one
+    process, and the resulting failure surfaces as a mid-run privilege error
+    rather than at startup.
+    """
+    from .auth import AuthMode, connection_class, connection_kwargs, resolve_auth_mode
+
+    mode = resolve_auth_mode(auth)
+    resolved = dsn or dsn_from_env()
+
     try:
-        # psycopg's `connect` overloads do not carry the row_factory's row type
-        # through to the returned Connection, so the cast restates what
-        # `row_factory=dict_row` already guarantees at runtime.
-        conn = cast(
-            DbConnection,
-            psycopg.connect(
-                dsn or dsn_from_env(),
-                row_factory=dict_row,  # pyright: ignore[reportArgumentType]
-            ),
-        )
+        if mode is AuthMode.PASSWORD:
+            # Untouched path: psycopg.connect exactly as before.
+            conn = cast(
+                DbConnection,
+                psycopg.connect(
+                    resolved,
+                    row_factory=dict_row,  # pyright: ignore[reportArgumentType]
+                    autocommit=autocommit,
+                ),
+            )
+        else:
+            cls = connection_class(mode, is_async=False)
+            conn = cast(
+                DbConnection,
+                cls.connect(
+                    resolved,
+                    row_factory=dict_row,
+                    autocommit=autocommit,
+                    **connection_kwargs(mode, is_async=False),
+                ),
+            )
     except psycopg.Error as exc:  # pragma: no cover - connection-time failure
         raise RegistryError(f"cannot reach the run registry: {exc}") from exc
     try:
-        with conn:
+        if autocommit:
+            # No `with conn:` — that block wraps the body in a transaction, which
+            # is the thing this mode exists to avoid.
             yield conn
+        else:
+            with conn:
+                yield conn
     finally:
         conn.close()
 
