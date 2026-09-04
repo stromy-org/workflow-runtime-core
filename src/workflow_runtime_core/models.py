@@ -161,6 +161,15 @@ class RunRecord:
         migration 0002 onward — it is the reliable "this row has a data plane"
         marker, where ``attempt_no`` defaults to 1 and so cannot distinguish a v1
         row from a first attempt.
+
+        ``workspace_id`` is emitted alongside that block because it is the caller's
+        only handle on the run's durable folder — ``/mnt/runs/<client_slug>/<workspace_id>``
+        — and, unlike ``run_id``, it is STABLE across a resume and a retry. Withholding
+        it did not hide it: absolute paths in workflow state carry the value out
+        through ``interrupt_payload`` anyway, unlabelled, next to identifiers that are
+        all ``run_id``. Measured 2026-08-31 on run ``4f18ec95``, an agent read that
+        second UUID, assumed the only name it had for a UUID, and reported a
+        confidently wrong location. Naming it is what makes the two distinguishable.
         """
         payload: dict[str, Any] = {
             "run_id": self.run_id,
@@ -174,6 +183,7 @@ class RunRecord:
             "artifacts": self.artifacts_json,
         }
         if self.workspace_id is not None:
+            payload["workspace_id"] = self.workspace_id
             payload["attempt"] = {"attempt_no": self.attempt_no, "retry_of": self.retry_of}
         if self.progress_json is not None:
             payload["progress"] = self.progress_json
