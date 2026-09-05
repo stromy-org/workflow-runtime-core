@@ -130,7 +130,7 @@ def connect(
                     resolved,
                     row_factory=dict_row,
                     autocommit=autocommit,
-                    **connection_kwargs(mode, is_async=False),
+                    **connection_kwargs(mode, resolved),
                 ),
             )
     except psycopg.Error as exc:  # pragma: no cover - connection-time failure

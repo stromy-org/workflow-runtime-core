@@ -80,24 +80,6 @@ wheels = [
 ]
 
 [[package]]
-name = "azure-postgresql-auth"
-version = "1.0.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "azure-core" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/da/08/3693f6d44881ba36a6d7de88b0913b332336dbca47f76ef7f55696a598cd/azure_postgresql_auth-1.0.2.tar.gz", hash = "sha256:c0b2a63791d547af8e2ef6d0ca363f53583d6ba93a345a9ad491e7125d75c6d1", size = 23036, upload-time = "2026-04-29T03:33:39.042Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ad/bc/a01902f77f62519d727b6fda17586b3dd031df0290a4f535f51c4723de62/azure_postgresql_auth-1.0.2-py3-none-any.whl", hash = "sha256:12ff55bbf3a91822e01f14b4224fc9bd5713476fecdc72a3b250ea7a4265eb43", size = 17667, upload-time = "2026-04-29T03:33:40.3Z" },
-]
-
-[package.optional-dependencies]
-psycopg3 = [
-    { name = "psycopg", extra = ["binary"] },
-    { name = "psycopg-pool" },
-]
-
-[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -1620,7 +1602,7 @@ wheels = [
 
 [[package]]
 name = "workflow-runtime-core"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1631,7 +1613,6 @@ dependencies = [
 all = [
     { name = "aio-pika" },
     { name = "azure-identity" },
-    { name = "azure-postgresql-auth", extra = ["psycopg3"] },
     { name = "langgraph" },
     { name = "langgraph-checkpoint" },
     { name = "langgraph-checkpoint-postgres" },
@@ -1641,7 +1622,6 @@ all = [
 ]
 azure-postgres = [
     { name = "azure-identity" },
-    { name = "azure-postgresql-auth", extra = ["psycopg3"] },
 ]
 executor = [
     { name = "langgraph" },
@@ -1669,7 +1649,6 @@ dev = [
 requires-dist = [
     { name = "aio-pika", marker = "extra == 'rabbitmq'", specifier = ">=9.4,<10" },
     { name = "azure-identity", marker = "extra == 'azure-postgres'", specifier = ">=1,<2" },
-    { name = "azure-postgresql-auth", extras = ["psycopg3"], marker = "extra == 'azure-postgres'", specifier = ">=1.0.2,<2" },
     { name = "click", specifier = ">=8.0" },
     { name = "langgraph", marker = "extra == 'executor'", specifier = ">=1.0.6,<2" },
     { name = "langgraph-checkpoint", marker = "extra == 'executor'", specifier = ">=4.1.0,<5" },

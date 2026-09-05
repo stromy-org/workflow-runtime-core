@@ -282,7 +282,8 @@ async def _averify_checkpoint_store(saver: object) -> None:
 # ``AsyncConnection``, so under Entra auth it would open a password connection
 # with no password and fail. These wrappers reproduce its connection options
 # EXACTLY — autocommit, prepare_threshold=0, dict_row, all three load-bearing to
-# the saver — and vary only the connection class and the credential.
+# the saver — and vary only the password, which under Entra is a freshly
+# acquired access token.
 #
 # The options are copied deliberately rather than referenced, because langgraph
 # does not export them; the integration test that opens a real saver through
@@ -300,7 +301,7 @@ def _saver_session(saver_cls: object, dsn: str) -> Generator[PostgresSaver]:
     mode = resolve_auth_mode()
     cls = connection_class(mode, is_async=False)
     with cls.connect(
-        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **connection_kwargs(mode, is_async=False)
+        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **connection_kwargs(mode, dsn)
     ) as conn:
         yield saver_cls(conn)  # type: ignore[operator]
 
@@ -310,12 +311,12 @@ async def _asaver_session(saver_cls: object, dsn: str) -> AsyncGenerator[AsyncPo
     """Open an async saver on a connection built for the configured auth mode."""
     from psycopg.rows import dict_row
 
-    from ..auth import connection_class, connection_kwargs, resolve_auth_mode
+    from ..auth import connection_class, connection_kwargs_async, resolve_auth_mode
 
     mode = resolve_auth_mode()
     cls = connection_class(mode, is_async=True)
     async with await cls.connect(
-        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **connection_kwargs(mode, is_async=True)
+        dsn, row_factory=dict_row, **_SAVER_CONNECT_KWARGS, **await connection_kwargs_async(mode, dsn)
     ) as conn:
         yield saver_cls(conn=conn)  # type: ignore[operator]
 
