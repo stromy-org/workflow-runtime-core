@@ -62,7 +62,38 @@ jobs:
           token: ${{ steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
 
+      # A satellite with no App token cannot read the private template, so the
+      # only honest outcomes are "skipped" or "did the work" — never "failed".
+      # Before this gate existed the token step skipped correctly and every
+      # LATER step ran anyway, so `copier update` shelled out to an
+      # unauthenticated `git ls-remote` and the job died red with
+      # "Repository not found". Measured 2026-09-05: four PUBLIC satellites
+      # (asset-transport, stromy-byok, workflow-runtime-core,
+      # stromy-workflows-mcp) had been failing that way on every weekly run,
+      # indistinguishable from a real breakage. A permanently-red alarm nobody
+      # can act on is the documented way a gate gets trained away.
+      - name: Check token availability
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.app-token.outputs.token }}" ]; then
+            echo "::warning title=Copier update skipped::No stromy-ci App token available for ${{ github.repository }}. Expected on a PUBLIC satellite — the CI_APP org secrets are scoped to private repos only (ci-secret-scope.json), so this repo can never authenticate to the private template. Its updates arrive by push instead, from stromy-org's push-template-sync.yml. This run did nothing."
+            {
+              echo "### Copier update: SKIPPED"
+              echo ""
+              echo "No \`stromy-ci\` App token available — cannot authenticate to the"
+              echo "private \`python-library-template\` repo. Nothing was done."
+              echo ""
+              echo "This is expected on a public satellite; template updates reach it"
+              echo "via \`push-template-sync.yml\` in stromy-org."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install uv
+        if: steps.gate.outputs.ok == 'true'
         uses: astral-sh/setup-uv@v5
 
       # Fix (a): python-library-template is a PRIVATE repo. `copier update`
@@ -71,12 +102,13 @@ jobs:
       # clone has no credentials of its own and 404s on a private repo unless
       # git itself is told to inject the App token for any stromy-org URL.
       - name: Authenticate git clones of the (private) template with the App token
-        if: steps.app-token.outputs.token != ''
+        if: steps.gate.outputs.ok == 'true'
         run: |
           git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/stromy-org/".insteadOf "https://github.com/stromy-org/"
 
       - name: Run copier update
         id: update
+        if: steps.gate.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
         run: |
@@ -111,7 +143,7 @@ jobs:
           fi
 
       - name: Open update PR (never auto-merge)
-        if: steps.update.outputs.changed == 'true' && steps.update.outputs.conflict == 'false'
+        if: steps.gate.outputs.ok == 'true' && steps.update.outputs.changed == 'true' && steps.update.outputs.conflict == 'false'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ steps.app-token.outputs.token || github.token }}
@@ -130,7 +162,7 @@ jobs:
             chrome (workflows, scripts, docs, config). Report it.
 
       - name: File conflict tracking issue
-        if: steps.update.outputs.conflict == 'true'
+        if: steps.gate.outputs.ok == 'true' && steps.update.outputs.conflict == 'true'
         env:
           # In-repo issue writes use the workflow's own token — the
           # permissions block above already grants it; the stromy-ci App
