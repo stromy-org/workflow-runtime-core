@@ -18,8 +18,9 @@ Everything is opt-in
 --------------------
 ``WRC_PG_AUTH`` defaults to ``password``, so an existing consumer that installs
 this version and changes nothing keeps the exact behaviour it had. The Entra
-path additionally requires the ``azure-postgres`` extra; without it the failure
-is a named, actionable error rather than an ImportError from three frames down.
+path additionally requires the ``azure-postgres`` extra (``azure-identity``);
+without it the failure is a named, actionable error rather than an ImportError
+from three frames down.
 
 Why the credential is chosen explicitly
 ---------------------------------------
@@ -32,12 +33,33 @@ not a guess.
 
 Sync and async credentials are different objects
 ------------------------------------------------
-``EntraConnection`` requires a sync ``TokenCredential`` and
-``AsyncEntraConnection`` an ``AsyncTokenCredential``; passing the wrong kind
-raises ``CredentialValueError`` inside the adapter. That is easy to get wrong
-because the two classes have identical names in ``azure.identity`` and
-``azure.identity.aio``, so the choice is made here, once, rather than at each
-call site.
+The two credential classes carry identical names in ``azure.identity`` and
+``azure.identity.aio`` while being incompatible objects, so the choice is made
+here, once, rather than at each call site.
+
+Why the principal name is READ, never derived
+---------------------------------------------
+The database user is taken verbatim from the DSN, which Terraform renders from
+the same declaration that the reconciler grants ``stromy_app`` to. It is never
+inferred from the token.
+
+That is not a stylistic preference; deriving it is a defect this module used to
+carry. ``azure-postgresql-auth`` builds the username from the token's
+``xms_mirid`` claim, and its ``parse_principal_name`` returns a name ONLY when
+that claim ends in ``providers/microsoft.managedidentity/userassignedidentities``
+(core.py:91). A SYSTEM-assigned identity's claim is the *resource's* ID, so the
+function returns ``None``; a managed-identity token carries no ``upn``,
+``preferred_username`` or ``unique_name``; the management-scope retry reads the
+same claim shape and also fails — and the whole thing surfaces as the opaque
+``Could not retrieve Entra credentials``.
+
+Measured 2026-09-05: that broke three of five consumers (``stromy-workflows-mcp``,
+``stromy-runner``, ``stromy-intel-weekly``) while the two on a user-assigned
+identity worked, so the estate looked healthy from any single sample. The
+derivation adds nothing even when it succeeds — it reconstructs the name the DSN
+already carries. So this module acquires the token itself and connects with the
+plain psycopg classes. An Entra DSN with no user is a hard, named error, because
+the alternative to a declared principal is a guessed one.
 """
 
 from __future__ import annotations
@@ -250,11 +272,11 @@ def _require_azure_extra(exc: ImportError) -> AuthConfigurationError:
 def build_credential(source: CredentialSource, *, is_async: bool) -> Any:
     """Construct the token credential for ``source``.
 
-    ``is_async`` is not a convenience flag. ``EntraConnection`` requires a sync
-    ``TokenCredential`` and ``AsyncEntraConnection`` an ``AsyncTokenCredential``,
-    and the adapter raises ``CredentialValueError`` on a mismatch — while the two
-    classes carry identical names in ``azure.identity`` and
-    ``azure.identity.aio``. Choosing here means a call site cannot get it wrong.
+    ``is_async`` is not a convenience flag. A sync caller needs a
+    ``TokenCredential`` and an async one an ``AsyncTokenCredential``: the former's
+    ``get_token`` returns a token, the latter's returns a coroutine. The two
+    classes carry identical names in ``azure.identity`` and ``azure.identity.aio``,
+    so choosing here means a call site cannot get it wrong.
     """
     try:
         if is_async:
@@ -274,13 +296,46 @@ def build_credential(source: CredentialSource, *, is_async: bool) -> Any:
     return AzureCliCredential()
 
 
-def entra_connection_classes(*, is_async: bool) -> Any:
-    """Return the adapter connection class for the requested flavour."""
+#: The audience an Azure Database for PostgreSQL access token must be issued for.
+#: Same value ``azure-postgresql-auth`` uses; named here so the connect path owns
+#: its own contract rather than importing a constant from a library it no longer
+#: connects through.
+PG_TOKEN_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"  # noqa: S105 - a public audience URI, not a credential
+
+
+def principal_from_dsn(dsn: str) -> str:
+    """The database role the DSN declares, or a named error.
+
+    Under Entra there is no password to fall back on and no safe way to guess a
+    principal, so an absent user is a configuration error surfaced here — at
+    connect time, naming the fix — rather than an opaque failure from inside a
+    token helper.
+    """
+    from psycopg.conninfo import conninfo_to_dict  # noqa: PLC0415
+
     try:
-        from azure_postgresql_auth.psycopg3 import AsyncEntraConnection, EntraConnection
-    except ImportError as exc:  # pragma: no cover - dependency wiring
-        raise _require_azure_extra(exc) from exc
-    return AsyncEntraConnection if is_async else EntraConnection
+        user = conninfo_to_dict(dsn).get("user")
+    except Exception as exc:  # pragma: no cover - malformed DSN
+        raise AuthConfigurationError(f"could not parse the connection string: {exc}") from exc
+    if not user or not isinstance(user, str):
+        raise AuthConfigurationError(
+            f"{AUTH_ENV}=entra requires the connection string to name the database "
+            "principal (its user component), e.g. "
+            "postgresql://<principal>@<host>:5432/<db>?sslmode=require. It is never "
+            "derived from the token: a system-assigned identity's token does not "
+            "carry a usable name, and guessing one is how a workload silently "
+            "authenticates as nobody."
+        )
+    return user
+
+
+def _token(credential: Any) -> str:
+    return cast("str", credential.get_token(PG_TOKEN_SCOPE).token)
+
+
+async def _token_async(credential: Any) -> str:
+    token = await credential.get_token(PG_TOKEN_SCOPE)
+    return cast("str", token.token)
 
 
 # --- describing the live session ---------------------------------------------
@@ -379,24 +434,48 @@ def set_role(conn: Any, role: str, *, local: bool = True) -> None:
         raise MigrationRoleRequired(role, str(exc)) from exc
 
 
-def connection_kwargs(mode: AuthMode, *, is_async: bool) -> dict[str, Any]:
-    """Extra keyword arguments psycopg needs for ``mode``.
+def connection_kwargs(mode: AuthMode, dsn: str) -> dict[str, Any]:
+    """Extra keyword arguments psycopg needs for ``mode`` (synchronous).
 
     Empty for password auth, so the password path is byte-for-byte what it was.
+    Under Entra it is ``{"password": <access token>}`` — the user is already in
+    the DSN and is validated here so a missing one fails before the socket opens
+    rather than as a server-side authentication error.
     """
     if mode is AuthMode.PASSWORD:
         return {}
-    source = resolve_credential_source()
-    return {"credential": build_credential(source, is_async=is_async)}
+    principal_from_dsn(dsn)
+    credential = build_credential(resolve_credential_source(), is_async=False)
+    return {"password": _token(credential)}
+
+
+async def connection_kwargs_async(mode: AuthMode, dsn: str) -> dict[str, Any]:
+    """Asynchronous twin of :func:`connection_kwargs`.
+
+    Separate rather than an ``is_async`` flag because acquiring the token is an
+    await: a flag would force a sync function to return a coroutine on one branch
+    and a dict on the other.
+    """
+    if mode is AuthMode.PASSWORD:
+        return {}
+    principal_from_dsn(dsn)
+    credential = build_credential(resolve_credential_source(), is_async=True)
+    try:
+        return {"password": await _token_async(credential)}
+    finally:
+        await credential.close()
 
 
 def connection_class(mode: AuthMode, *, is_async: bool) -> Any:
-    """The psycopg connection class implementing ``mode``."""
-    if mode is AuthMode.PASSWORD:
-        import psycopg
+    """The psycopg connection class implementing ``mode``.
 
-        return psycopg.AsyncConnection if is_async else psycopg.Connection
-    return entra_connection_classes(is_async=is_async)
+    Both modes now use the plain psycopg classes. Entra differs only in where the
+    password comes from, which is exactly the amount of difference it should ever
+    have had — see "Why the principal name is READ, never derived" above.
+    """
+    import psycopg  # noqa: PLC0415
+
+    return psycopg.AsyncConnection if is_async else psycopg.Connection
 
 
 __all__ = [
@@ -410,9 +489,11 @@ __all__ = [
     "AuthMode",
     "CheckpointSetupMode",
     "CredentialSource",
+    "PG_TOKEN_SCOPE",
     "build_credential",
     "can_write_table",
     "connection_class",
+    "connection_kwargs_async",
     "connection_kwargs",
     "describe_session",
     "resolve_application_role",
