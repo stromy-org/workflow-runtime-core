@@ -105,31 +105,19 @@ jobs:
       # To re-enable: add this repo to the CI_APP_ID / CI_APP_PRIVATE_KEY
       # allowlists and the steps light up on the next tag, unchanged.
       # ---------------------------------------------------------------------
-      - name: Mint GitHub App token
-        # An App token (unlike the default GITHUB_TOKEN) can trigger the
-        # downstream bump workflow. See infra-docs/ai/cross-repo-pats.md.
-        if: env.HAS_CI_APP == 'true'
-        uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
 
-      - name: Notify Stromy,stromy-workflows-mcp to auto-bump the pin
-        # Fires a repository_dispatch event into the listed consumer repo(s).
-        # The bump-internal-lib.yml workflow there opens a PR rewriting the
-        # tag in [tool.uv.sources] and regenerating uv.lock.
-        if: env.HAS_CI_APP == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO_SLUG: ${{ github.event.repository.name }}
-        run: |
-          gh api repos/stromy-org/Stromy/dispatches \
-            -f event_type=internal-lib-released \
-            -F "client_payload[repo]=${REPO_SLUG}" \
-            -F "client_payload[tag]=${GITHUB_REF_NAME}"
-          gh api repos/stromy-org/stromy-workflows-mcp/dispatches \
-            -f event_type=internal-lib-released \
-            -F "client_payload[repo]=${REPO_SLUG}" \
-            -F "client_payload[tag]=${GITHUB_REF_NAME}"
+      # NO auto-bump dispatch here, deliberately (ORG-296, 2026-09-13).
+      #
+      # This step used to fire `repository_dispatch` at a hand-written list of
+      # consumer repos. `POST /dispatches` returns 204 whether or not anything
+      # listens, so the list could rot in silence — and it had: the receiver
+      # existed in one repo, five named targets had none, and eight real
+      # consumers were named by no sender at all.
+      #
+      # Pins are now reconciled centrally by stromy-org's
+      # .github/workflows/internal-lib-pins.yml, which DERIVES the consumer
+      # graph from every repo's own [tool.uv.sources] each run and opens the
+      # bump PRs. Nothing here needs to know who consumes this library.
+      #
+      # Re-adding a fan-out is gated: `internal-lib-pins.py --check` fails on a
+      # dispatch aimed at a repo with no receiver.
