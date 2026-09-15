@@ -22,6 +22,7 @@ permissions:
   contents: write
 
 jobs:
+<<<<<<< before updating
   # Refuse to publish a tag that is not reachable from main (ORG-PLAN-209).
   #
   # `verify tag matches pyproject version` proves the tag is *self-consistent*, not
@@ -40,6 +41,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+=======
+  # A RELEASE MUST SHIP REVIEWED, CI-GATED CODE — and until 2026-09-13 this
+  # template did not say so, while all six library satellites did. Every one of
+  # media-gen, lead-scout, linkedin-data, report-renderer, asset-transport and
+  # fetch-kit carries this guard; the template carried neither it nor the quality
+  # job, so a `copier update` REMOVED both from whichever satellite adopted it.
+  # Measured on a media-gen clone that day: the update deleted `guard` and
+  # `quality` and left `build-and-release` with no `needs:` at all — a release
+  # gate silently traded away for a template sync. Backported here so the
+  # template is no longer the one repo in its own fleet without it.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The ancestry test needs real history; a shallow clone makes
+          # `merge-base --is-ancestor` answer about a graph it cannot see.
+>>>>>>> after updating
           fetch-depth: 0
       - name: Refuse a tag that is not reachable from main
         run: |
@@ -50,8 +69,20 @@ jobs:
             exit 1
           fi
 
+<<<<<<< before updating
   build-and-release:
     needs: [guard]
+=======
+  quality:
+    needs: guard
+    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
+    with:
+      source_package: "src/workflow_runtime_core"
+    secrets: inherit
+
+  build-and-release:
+    needs: [guard, quality]
+>>>>>>> after updating
     runs-on: ubuntu-latest
     env:
       # The `secrets` context is NOT available in a step-level `if:` — using it
@@ -61,8 +92,8 @@ jobs:
       # steps below test a plain string.
       HAS_CI_APP: ${{ secrets.CI_APP_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
       - name: Build distributions
@@ -84,6 +115,7 @@ jobs:
             --generate-notes \
             dist/*
 
+<<<<<<< before updating
       # ---------------------------------------------------------------------
       # Consumer auto-bump — DISABLED-BY-ABSENCE on this repo, deliberately.
       #
@@ -121,3 +153,19 @@ jobs:
       #
       # Re-adding a fan-out is gated: `internal-lib-pins.py --check` fails on a
       # dispatch aimed at a repo with no receiver.
+=======
+      # NO auto-bump dispatch here, deliberately (ORG-296, 2026-09-13).
+      #
+      # This template used to ship a `repository_dispatch` fan-out driven by a
+      # `consumer_repos_to_notify` answer — a consumer list frozen into each
+      # satellite at scaffold time and updated by nobody afterwards. `POST
+      # /dispatches` returns 204 whether or not anything listens, so those lists
+      # rotted invisibly: measured across the org, the receiver existed in ONE
+      # repo, five named targets had none, and eight real consumers were named
+      # by no sender at all.
+      #
+      # Pins are reconciled centrally instead, by stromy-org's
+      # .github/workflows/internal-lib-pins.yml, which DERIVES the consumer graph
+      # from every repo's own [tool.uv.sources] on each run. A library must not
+      # need to know who consumes it — a scaffold-time answer can never stay true.
+>>>>>>> after updating

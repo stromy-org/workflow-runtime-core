@@ -49,7 +49,7 @@ workflow-runtime-core/
 2. Update `CHANGELOG.md` if present.
 3. Commit via `/conventional-commit`.
 4. `git tag vX.Y.Z && git push --tags`.
-5. CI runs `release.yml`, builds sdist+wheel, publishes a GitHub Release, and fires a `repository_dispatch` into each `consumer_repos_to_notify` to open a pin-bump PR — authenticated by the org `stromy-ci` GitHub App token (org secrets `CI_APP_ID`/`CI_APP_PRIVATE_KEY`).
+5. CI runs `release.yml`, builds sdist+wheel and publishes a GitHub Release. **Consumer pins are not your job.** stromy-org's `internal-lib-pins.yml` reconciles every consumer daily: it derives the graph from each repo's own `[tool.uv.sources]` and opens the bump PRs, so this library never has to know who depends on it. Releasing is the whole task.
 6. `notify-parent.yml` fires a `submodule-bumped` event into stromy-org; the daily cron opens a pointer-bump PR if the dispatch was missed.
 
 ### Refresh AGENTS / re-render
