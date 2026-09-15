@@ -177,6 +177,89 @@ def test_the_public_projection_of_a_real_row_hides_the_pin(blank_dsn: str) -> No
     assert "credential_policy" not in rendered
 
 
+@pytest.mark.integration
+def test_degradations_accumulate_per_attempt_and_reach_the_client(
+    blank_dsn: str,
+) -> None:
+    """A thinner answer must be legible from the run row, not only from a log.
+
+    `completed` reads identically whether every evidence channel ran or one
+    did, so the withheld set is recorded rather than inferred.
+    """
+    run_id = _run_on(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        registry.pin_execution_metadata(conn, run_id, _PINNED)
+        registry.record_degradations(
+            conn,
+            run_id,
+            [
+                {
+                    "kind": "credential_unfunded",
+                    "credential_id": "serper-api",
+                    "detail": "web sourcing disabled",
+                }
+            ],
+            attempt_no=1,
+        )
+        registry.record_degradations(
+            conn,
+            run_id,
+            [{"kind": "credential_unfunded", "credential_id": "core-api"}],
+            attempt_no=2,
+        )
+    with registry.connect(blank_dsn) as conn:
+        # The pin is untouched by an observation, exactly as for sources.
+        assert registry.read_execution_metadata(conn, run_id) == _PINNED
+        run = registry.get_run(conn, run_id)
+    assert run is not None
+    recorded = run.public()["execution"]["degradations"]
+    assert recorded["1"][0]["credential_id"] == "serper-api"
+    assert recorded["2"][0]["credential_id"] == "core-api"
+    assert "credential_policy" not in str(run.public())
+
+
+@pytest.mark.integration
+def test_no_degradations_writes_nothing(blank_dsn: str) -> None:
+    """NEGATIVE CONTROL: an empty list must not create an empty-looking record.
+
+    `"degradations": {"1": []}` would read as "we checked and there were none"
+    on a run where the writer was never reached at all.
+    """
+    run_id = _run_on(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        registry.record_degradations(conn, run_id, [])
+    with registry.connect(blank_dsn) as conn:
+        run = registry.get_run(conn, run_id)
+    assert run is not None
+    assert "execution" not in run.public()
+
+
+@pytest.mark.integration
+def test_an_unknown_degradation_kind_is_refused(blank_dsn: str) -> None:
+    """NEGATIVE CONTROL for the kind allowlist — a typo'd or undeclared kind is
+    a class nobody decided was client-safe, and this column is projected."""
+    run_id = _run_on(blank_dsn)
+    with registry.connect(blank_dsn) as conn, pytest.raises(RegistryError, match="unknown degrad"):
+        registry.record_degradations(
+            conn, run_id, [{"kind": "credentials_unfunded", "credential_id": "x"}]
+        )
+    with registry.connect(blank_dsn) as conn:
+        run = registry.get_run(conn, run_id)
+    assert run is not None
+    assert "execution" not in run.public()
+
+
+@pytest.mark.integration
+def test_a_non_string_degradation_field_is_refused(blank_dsn: str) -> None:
+    run_id = _run_on(blank_dsn)
+    with registry.connect(blank_dsn) as conn, pytest.raises(RegistryError, match="never values"):
+        registry.record_degradations(
+            conn,
+            run_id,
+            [{"kind": "credential_unfunded", "credential_id": {"v": "secret"}}],  # type: ignore[dict-item]
+        )
+
+
 # --- 2. consumer-owned events -------------------------------------------------
 
 

@@ -27,7 +27,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, NoReturn, cast
 
@@ -739,6 +739,88 @@ def record_credential_sources(
             )
     except psycopg.errors.UndefinedColumn as exc:
         _require_execution_metadata_column(exc, "record_credential_sources")
+
+
+#: Degradation kinds this module will store. An allowlist for the same reason
+#: the public projection is one: a caller inventing a kind is either a typo or a
+#: new class nobody has decided is client-safe, and both are better refused here
+#: than discovered in a client's payload.
+DEGRADATION_KINDS = frozenset({"credential_unfunded"})
+
+
+def record_degradations(
+    conn: DbConnection,
+    run_id: str,
+    entries: Sequence[Mapping[str, str]],
+    *,
+    attempt_no: int = 1,
+) -> None:
+    """Record capabilities this attempt did NOT have. Never any value.
+
+    A degraded run is one that completed while a declared capability was
+    missing — most concretely, an optional evidence channel whose credential
+    nobody funds, which produces a thinner answer rather than a failure. That
+    distinction is invisible in a terminal status: `completed` reads identically
+    whether six channels ran or one did.
+
+    So it is recorded as data. Counting the withheld set is the whole point —
+    an ERROR line in a log aggregator is not a signal a client can reach, and
+    inferring "it must have been fine" from the absence of a failure is the same
+    reasoning that hides a silent fallback everywhere else in this plane.
+
+    Per attempt, beside ``credential_sources`` and for the same reason: a retry
+    observes for itself, so it gets its own entry rather than overwriting the
+    first attempt's account. An empty ``entries`` writes nothing — "no
+    degradations" and "never asked" are both honestly represented by absence
+    here, because the attempt's presence in ``credential_sources`` already
+    proves the binding ran.
+
+    Entries carry a ``kind`` from :data:`DEGRADATION_KINDS` plus free-form
+    identifying fields (``credential_id``, ``detail``). Values are LABELS and
+    identifiers — never a secret, and this refuses anything non-string for the
+    same reason ``record_credential_sources`` does.
+    """
+    if not entries:
+        return
+    cleaned: list[dict[str, str]] = []
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind not in DEGRADATION_KINDS:
+            raise RegistryError(
+                f"unknown degradation kind {kind!r}; declare it in DEGRADATION_KINDS"
+            )
+        # Annotated ``str``, checked anyway — the same reasoning as
+        # ``record_credential_sources``: the annotation is advice, and this is
+        # the only thing between a caller's mistake and a provider key landing
+        # in a column that gets projected to the client.
+        if not all(
+            isinstance(value, str) for value in cast("Mapping[str, object]", entry).values()
+        ):
+            raise RegistryError("degradation fields must be strings, never values")
+        cleaned.append(dict(entry))
+
+    payload = json.dumps({str(attempt_no): cleaned})
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET execution_metadata_json =
+                         coalesce(execution_metadata_json, '{}'::jsonb)
+                         || jsonb_build_object(
+                              'degradations',
+                              coalesce(
+                                  execution_metadata_json -> 'degradations',
+                                  '{}'::jsonb
+                              ) || %s::jsonb
+                            ),
+                       updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (payload, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "record_degradations")
 
 
 def mark_dispatch_failed(conn: DbConnection, run_id: str, reason: str) -> None:

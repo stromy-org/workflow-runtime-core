@@ -95,9 +95,27 @@ def test_projection_of_a_non_object_is_empty(raw: object) -> None:
 
 
 @pytest.mark.unit
-def test_the_allowlist_is_exactly_one_key() -> None:
+def test_the_allowlist_is_exactly_its_two_keys() -> None:
     """Pinned deliberately. Widening it is a decision, not a refactor."""
-    assert PUBLIC_EXECUTION_METADATA_KEYS == frozenset({"credential_sources"})
+    assert PUBLIC_EXECUTION_METADATA_KEYS == frozenset(
+        {"credential_sources", "degradations"}
+    )
+
+
+@pytest.mark.unit
+def test_degradations_reach_the_client() -> None:
+    """A client who paid for the run may see which channels it actually had."""
+    raw = {
+        "pinned": {"credential_policy": "client"},
+        "credential_sources": {"1": {"openai-api": "caller-byok"}},
+        "degradations": {
+            "1": [{"kind": "credential_unfunded", "credential_id": "serper-api"}]
+        },
+    }
+    projected = public_execution_metadata(raw)
+    assert projected["degradations"]["1"][0]["credential_id"] == "serper-api"
+    # NEGATIVE CONTROL: widening the allowlist must not have widened it further.
+    assert "pinned" not in projected
 
 
 # --- the public run projection ------------------------------------------------

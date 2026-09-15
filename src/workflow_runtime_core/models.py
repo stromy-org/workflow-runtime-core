@@ -42,7 +42,12 @@ TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
 #: credential policy, the subject, the model-registry digest — is operator-facing
 #: detail about how the platform is configured, and a client can act on none of
 #: it.
-PUBLIC_EXECUTION_METADATA_KEYS = frozenset({"credential_sources"})
+#: ``degradations`` is here because a client who paid for a run is entitled to
+#: know which declared capabilities it actually had. A channel that produced
+#: nothing for want of a funded credential used to be visible only as an ERROR
+#: line in the operator's log aggregator, which made a thinner answer
+#: indistinguishable from a complete one on every surface the client can reach.
+PUBLIC_EXECUTION_METADATA_KEYS = frozenset({"credential_sources", "degradations"})
 
 
 def public_execution_metadata(raw: dict[str, Any] | None) -> dict[str, Any]:
