@@ -20,14 +20,20 @@ same call sequence (``ainvoke`` then ``aget_state``).
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from workflow_runtime_core import registry
 from workflow_runtime_core.exceptions import CheckpointerError, LeaseLost, StageFailure
 from workflow_runtime_core.executor.checkpointer import acheckpointer
-from workflow_runtime_core.executor.runner import EXIT_CLAIM_LOST, EXIT_FAILED, EXIT_OK, execute
+from workflow_runtime_core.executor.runner import (
+    EXIT_CLAIM_LOST,
+    EXIT_FAILED,
+    EXIT_OK,
+    _record_failure,
+    execute,
+)
 from workflow_runtime_core.migrations import apply_migrations
 from workflow_runtime_core.models import RunRecord, RunStatus, TerminalProjection
 
@@ -674,3 +680,37 @@ def test_a_run_with_no_pinned_snapshot_asserts_nothing_about_cost(blank_dsn: str
     after = _row(blank_dsn, run.run_id)
     assert after.error_json is not None
     assert "spends" not in after.error_json
+
+
+@pytest.mark.integration
+def test_a_consumer_supplied_run_object_without_the_v2_fields_still_records(
+    blank_dsn: str,
+) -> None:
+    """NEGATIVE CONTROL for the core's own compatibility contract.
+
+    ``execute`` may be driven with a consumer's own run-shaped object — the
+    extracted Stromy worker does exactly that — so every field this recorder
+    reads beyond ``run_id`` has to be read defensively. Reaching for
+    ``run.progress_json`` directly turned a recorded failure into an
+    ``AttributeError`` inside the failure handler, which is the worst place in
+    the system to raise: the run's real error is lost and the row never reaches a
+    terminal status.
+    """
+
+    class _MinimalRun:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+    run = _claimed(blank_dsn)
+    rc = _record_failure(
+        cast("RunRecord", _MinimalRun(run.run_id)),
+        RuntimeError("boom"),
+        dsn=blank_dsn,
+    )
+    assert rc == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.status is RunStatus.FAILED
+    assert after.error_json is not None
+    assert after.error_json["retryable"] is True
+    assert after.error_json["message"] == "boom"
