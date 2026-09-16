@@ -20,6 +20,7 @@ import pytest
 from workflow_runtime_core import registry
 from workflow_runtime_core.exceptions import (
     ActiveAttemptExists,
+    RegistryError,
     SchemaVersionMismatch,
 )
 from workflow_runtime_core.migrations import (
@@ -129,6 +130,55 @@ def test_lease_renewal_is_owner_scoped(blank_dsn: str) -> None:
         assert registry.renew_lease(conn, run_id=run.run_id, owner="w1", lease_seconds=60)
         # A worker that is NOT the lease owner must learn it lost, and stop.
         assert not registry.renew_lease(conn, run_id=run.run_id, owner="w2", lease_seconds=60)
+
+
+@pytest.mark.integration
+def test_cancelling_a_running_run_refuses_its_owner_next_renewal(blank_dsn: str) -> None:
+    """The stop button, and the whole mechanism behind it.
+
+    Nothing reaches a running worker directly. ``cancel_run`` flips the status,
+    and the worker finds out only because ``renew_lease`` renews a run that is
+    still RUNNING and nothing else; the refused renewal is what makes
+    ``_with_lease_renewal`` cancel the graph mid-node and exit. Which means the
+    load-bearing assertion here is the NEGATIVE one — the same owner, whose
+    renewal succeeded a moment earlier, must now be told no.
+
+    Pinned because dropping the status predicate from ``renew_lease`` would
+    leave every other test in this file green while a cancelled, client-funded
+    run kept spending the client's own keys to completion, reporting
+    ``cancelled`` on every surface the whole way. Measured 2026-09-16 on hosted
+    run ``65c953a6``: cancel at 12:41:00Z, container exit at 12:41:30Z — one
+    renewal tick, which is the behaviour this test exists to keep.
+
+    The lease is granted already-expired (``lease_seconds=-1``) so the final
+    assertion is not vacuous: the sweeper's own age condition is satisfied, and
+    the ONLY thing standing between a cancelled run and a second billed
+    execution is that its status is no longer RUNNING.
+    """
+    _migrated(blank_dsn)
+    dispatch = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_dispatch(conn, run.run_id, dispatch)
+        registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="w1", lease_seconds=-1
+        )
+        # Baseline: renewal works for this owner, so a refusal below can only
+        # be the cancellation and never a pre-existing lease problem.
+        assert registry.renew_lease(conn, run_id=run.run_id, owner="w1", lease_seconds=-1)
+
+        cancelled = registry.cancel_run(conn, run.run_id)
+        assert cancelled.status.value == "cancelled"
+
+        # The negative control: the signal the executor turns into a stop.
+        assert not registry.renew_lease(conn, run_id=run.run_id, owner="w1", lease_seconds=-1)
+
+        # A cancelled run is terminal in both directions: the lapsed-lease
+        # sweeper must not resurrect it into a second, separately billed run,
+        # and a second cancel is refused rather than silently re-applied.
+        assert not registry.requeue_expired_lease(conn, run.run_id)
+        with pytest.raises(RegistryError):
+            registry.cancel_run(conn, run.run_id)
 
 
 @pytest.mark.integration
