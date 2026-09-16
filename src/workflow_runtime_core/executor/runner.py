@@ -530,7 +530,13 @@ def _record_failure(run: RunRecord, exc: BaseException, *, dsn: str | None) -> i
         "run %s failed at stage %s (correlation_id=%s)", run.run_id, stage, correlation_id
     )
     message = str(exc)
-    node = _last_node(run.progress_json)
+    # ``getattr`` on both v2 fields for the reason :func:`_nodes_completed_so_far`
+    # documents: a consumer may drive ``execute`` with its own run-shaped object,
+    # and requiring a new attribute would break it on upgrade. A run that cannot
+    # say where it got to, or whether it has a predecessor, simply gets the
+    # answer for a first attempt that got nowhere.
+    node = _last_node(getattr(run, "progress_json", None))
+    retry_of: object = getattr(run, "retry_of", None)
     with registry.connect(dsn) as conn:
         live = schema.read_schema_version(conn)
         if live is not None and live >= 2:
@@ -545,8 +551,8 @@ def _record_failure(run: RunRecord, exc: BaseException, *, dsn: str | None) -> i
             # ...and a binding that did NOT say so can still be caught out by the
             # lineage: an attempt that reproduced its predecessor's failure exactly
             # has demonstrated the determinism the binding failed to declare.
-            if retryable and run.retry_of is not None:
-                prior = registry.get_run(conn, run.retry_of)
+            if retryable and isinstance(retry_of, str) and retry_of:
+                prior = registry.get_run(conn, retry_of)
                 if prior is not None and _is_deterministic_repeat(
                     error_type, node, prior.error_json, prior.progress_json
                 ):
