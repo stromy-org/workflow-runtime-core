@@ -17,7 +17,10 @@ import pytest
 
 from workflow_runtime_core.executor.runner import (
     _declared_retryable,
+    _is_deterministic_repeat,
+    _last_node,
     _nodes_completed_so_far,
+    _spends,
     _StageError,
 )
 from workflow_runtime_core.models import RunRecord, RunStatus
@@ -138,3 +141,114 @@ def test_an_unusable_prior_count_reads_as_zero(progress: object) -> None:
     have shaped differently. Anything unusable means "no prior count", which is
     exactly the fresh-run answer — never a crash on the resume path."""
     assert _nodes_completed_so_far(_run(progress)) == 0
+
+
+# --- honest retry advice under BYOK (ORG-PLAN-300 §6) -------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "progress",
+    [None, {}, {"node": ""}, {"node": 7}, {"node": None}, "not a mapping"],
+)
+def test_a_run_that_cannot_name_a_node_reads_as_none(progress: object) -> None:
+    """``None`` is the answer for "no node", and it is a real answer: a run that
+    failed in the credential stage never reached one."""
+    assert _last_node(progress) is None
+
+
+@pytest.mark.unit
+def test_the_last_recorded_node_is_read() -> None:
+    assert _last_node({"node": "run_driver_discovery", "nodes_completed": 7}) == "run_driver_discovery"
+
+
+@pytest.mark.unit
+def test_the_same_failure_at_the_same_node_is_a_repeat() -> None:
+    """One repetition is the whole evidence. The client is not asked to fund a
+    third identical run to establish what two already showed."""
+    assert (
+        _is_deterministic_repeat(
+            "AdapterError",
+            "run_driver_discovery",
+            {"error_type": "AdapterError", "message": "cannot rebind an active AuditLogger"},
+            {"node": "run_driver_discovery", "nodes_completed": 7},
+        )
+        is True
+    )
+
+
+@pytest.mark.unit
+def test_two_attempts_that_never_reached_a_node_still_agree() -> None:
+    """The BYOK case this exists for: both attempts died in the credential stage,
+    so neither has a node. Agreeing on "nowhere" is agreement."""
+    assert (
+        _is_deterministic_repeat(
+            "CredentialStageFailure", None, {"error_type": "CredentialStageFailure"}, None
+        )
+        is True
+    )
+
+
+@pytest.mark.unit
+def test_the_same_error_further_along_is_not_a_repeat() -> None:
+    """NEGATIVE CONTROL. An attempt that got further through the graph than its
+    predecessor is exactly the case a retry exists for — suppressing it would
+    strand a recoverable run, which is the more expensive of the two mistakes."""
+    assert (
+        _is_deterministic_repeat(
+            "AdapterError",
+            "synthesise_report",
+            {"error_type": "AdapterError"},
+            {"node": "run_driver_discovery"},
+        )
+        is False
+    )
+
+
+@pytest.mark.unit
+def test_a_different_error_at_the_same_node_is_not_a_repeat() -> None:
+    """NEGATIVE CONTROL for the other half of the pair: a node that fails twice
+    for two different reasons has not demonstrated anything deterministic."""
+    assert (
+        _is_deterministic_repeat(
+            "TimeoutError", "sourcing", {"error_type": "AdapterError"}, {"node": "sourcing"}
+        )
+        is False
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("prior_failure", [None, {}, "not a mapping", {"error_type": 7}])
+def test_a_predecessor_that_says_nothing_never_suppresses_a_retry(prior_failure: object) -> None:
+    """A parent row with no usable failure payload is not evidence of anything.
+    The absence of a reading must not read as a match."""
+    assert _is_deterministic_repeat("AdapterError", "sourcing", prior_failure, {"node": "sourcing"}) is False
+
+
+@pytest.mark.unit
+def test_a_client_funded_credential_makes_the_retry_cost_the_client() -> None:
+    assert _spends({"funding": {"openai-api": "client", "serper-api": "operator"}}) == "client"
+
+
+@pytest.mark.unit
+def test_a_wholly_operator_funded_run_costs_the_operator() -> None:
+    assert _spends({"funding": {"serper-api": "operator", "core-api": "operator"}}) == "operator"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [("client", "client"), ("operator", "operator")],
+)
+def test_a_pre_org300_snapshot_falls_back_to_its_coarse_policy(policy: str, expected: str) -> None:
+    """In-flight runs pinned before the funding map existed must still be able to
+    say who pays — their one policy covered every credential."""
+    assert _spends({"credential_policy": policy}) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pinned", [None, {}, {"funding": {}}, {"credential_policy": ""}])
+def test_an_unreadable_snapshot_asserts_nothing(pinned: object) -> None:
+    """NEGATIVE CONTROL. "operator" defaulted about a run we could not read is a
+    claim, not a reading — the key is omitted instead."""
+    assert _spends(pinned) is None  # type: ignore[arg-type]

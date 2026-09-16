@@ -201,6 +201,87 @@ def _declared_retryable(exc: BaseException) -> bool:
     return declared if isinstance(declared, bool) else True
 
 
+def _last_node(progress: object) -> str | None:
+    """The node label a run's progress row last recorded, or ``None``.
+
+    Read defensively for the same reason as :func:`_nodes_completed_so_far`:
+    ``progress_json`` is a JSON column an older writer may have shaped otherwise.
+
+    ``None`` is a real answer here rather than a failure to produce one. A run
+    that died in the credential stage never reached a node, and two attempts that
+    both died there *agree* about where they died.
+    """
+    if not isinstance(progress, dict):
+        return None
+    node = cast("dict[str, object]", progress).get("node")
+    return node if isinstance(node, str) and node else None
+
+
+def _is_deterministic_repeat(
+    error_type: str,
+    node: str | None,
+    prior_failure: object,
+    prior_progress: object,
+) -> bool:
+    """Whether this attempt reproduced the previous attempt's failure exactly.
+
+    ONE repetition is the whole evidence, deliberately. The alternative — a
+    denylist of exception types known to be deterministic — has to be maintained
+    against every binding in the fleet and goes quietly stale the first time one
+    of them raises something new, while "this already happened once, identically"
+    is a fact about *this* lineage that needs no maintenance at all.
+
+    **Both halves must match.** The error type alone is too coarse: the same
+    adapter error at two different nodes is two different failures, and one that
+    got further through the graph than its predecessor is precisely the case a
+    retry exists for. Matching ``None`` against ``None`` is intended, not an
+    oversight — see :func:`_last_node`.
+
+    Only ever narrows the verdict. A first attempt has no predecessor and is
+    never suppressed: there is nothing to compare against, and the optimistic
+    default is the right answer for a genuinely transient first failure.
+    """
+    if not isinstance(prior_failure, dict):
+        return False
+    prior_type = cast("dict[str, object]", prior_failure).get("error_type")
+    if not isinstance(prior_type, str) or prior_type != error_type:
+        return False
+    return _last_node(prior_progress) == node
+
+
+def _spends(pinned: dict[str, Any] | None) -> str | None:
+    """Whose money a retry of this run would spend, or ``None`` when unknowable.
+
+    A surface that offers a retry button should be able to say who pays *before*
+    the client presses it. Under BYOK that is no longer a rhetorical question:
+    the default ``retryable = True`` was justified on the grounds that "a
+    needless retry costs only compute", and a client-funded retry costs the
+    client money instead.
+
+    The answer comes from the run's PINNED funding map rather than the live
+    entitlement registry, because the pin is what the retry will itself re-read
+    — so an edit landing between the failure and the retry cannot move the funder
+    out from under the sentence the client was shown.
+
+    ``None`` rather than a default: a run carrying no pinned snapshot predates
+    ORG-PLAN-206, and "operator" *asserted* about a run we could not read is a
+    claim, not a reading. An absent key says "this registry cannot tell you";
+    a defaulted one says something that may be false.
+    """
+    if not isinstance(pinned, dict):
+        return None
+    funding = pinned.get("funding")
+    if isinstance(funding, dict) and funding:
+        # Any client-funded credential makes the retry cost the client money;
+        # the mixed case is a client-billed run with some of our keys in it.
+        return "client" if "client" in cast("dict[str, object]", funding).values() else "operator"
+    # A snapshot pinned before ORG-PLAN-300 carries one coarse policy instead.
+    policy = pinned.get("credential_policy")
+    if isinstance(policy, str) and policy:
+        return "client" if policy == "client" else "operator"
+    return None
+
+
 async def _with_lease_renewal(
     invocation: Awaitable[Any], lease: LeaseRenewer, *, run_id: str
 ) -> Any:
@@ -449,27 +530,55 @@ def _record_failure(run: RunRecord, exc: BaseException, *, dsn: str | None) -> i
         "run %s failed at stage %s (correlation_id=%s)", run.run_id, stage, correlation_id
     )
     message = str(exc)
+    node = _last_node(run.progress_json)
     with registry.connect(dsn) as conn:
         live = schema.read_schema_version(conn)
         if live is not None and live >= 2:
-            registry.mark_failed_structured(
-                conn,
-                run.run_id,
-                {
-                    "stage": stage,
-                    "error_type": error_type,
-                    "message": message[:2000],
-                    # Retryable by DEFAULT, not unconditionally: every stage the
-                    # core can fail at leaves the durable workspace and the
-                    # checkpoint intact, so a retry resumes rather than
-                    # recomputing. But a binding that knows a failure is
-                    # deterministic says so on the exception, and that verdict
-                    # has to survive to here — a client told "retryable" about a
-                    # malformed contract will retry into the identical failure.
-                    "retryable": _declared_retryable(exc),
-                    "correlation_id": correlation_id,
-                },
-            )
+            # Retryable by DEFAULT, not unconditionally: every stage the core can
+            # fail at leaves the durable workspace and the checkpoint intact, so a
+            # retry resumes rather than recomputing. But a binding that knows a
+            # failure is deterministic says so on the exception, and that verdict
+            # has to survive to here — a client told "retryable" about a malformed
+            # contract will retry into the identical failure.
+            retryable = _declared_retryable(exc)
+            reason: str | None = None
+            # ...and a binding that did NOT say so can still be caught out by the
+            # lineage: an attempt that reproduced its predecessor's failure exactly
+            # has demonstrated the determinism the binding failed to declare.
+            if retryable and run.retry_of is not None:
+                prior = registry.get_run(conn, run.retry_of)
+                if prior is not None and _is_deterministic_repeat(
+                    error_type, node, prior.error_json, prior.progress_json
+                ):
+                    retryable = False
+                    reason = "deterministic-repeat"
+
+            failure: dict[str, Any] = {
+                "stage": stage,
+                "error_type": error_type,
+                "message": message[:2000],
+                "retryable": retryable,
+                "correlation_id": correlation_id,
+            }
+            if reason is not None:
+                failure["reason"] = reason
+            try:
+                spends = _spends(registry.read_execution_metadata(conn, run.run_id))
+            except Exception:
+                # Swallowed in exactly this one place, and only here: the caller is
+                # recording a FAILURE, and a run whose failure went unrecorded
+                # because a bookkeeping read raised is strictly worse than one whose
+                # payload omits `spends`.
+                logger.warning(
+                    "run %s: could not read the pinned snapshot to attribute the retry cost",
+                    run.run_id,
+                    exc_info=True,
+                )
+                spends = None
+            if spends is not None:
+                failure["spends"] = spends
+
+            registry.mark_failed_structured(conn, run.run_id, failure)
         else:
             registry.mark_failed(conn, run.run_id, message)
     return EXIT_FAILED

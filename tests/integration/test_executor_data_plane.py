@@ -584,3 +584,93 @@ def test_a_genuine_open_failure_is_still_reported_as_one() -> None:
 
     with pytest.raises(CheckpointerError, match="cannot open the checkpoint store"):
         asyncio.run(_body())
+
+
+# --- 9. honest retry advice under BYOK (ORG-PLAN-300 §6) ----------------------
+
+
+def _retried(dsn: str, parent_id: str) -> RunRecord:
+    """Mint and claim the next attempt of a failed run."""
+    with registry.connect(dsn) as conn:
+        attempt = registry.create_retry(conn, run_id=parent_id)
+        claimed = registry.claim_run(conn, attempt.run_id)
+    assert claimed is not None
+    return claimed
+
+
+@pytest.mark.integration
+def test_an_attempt_reproducing_its_predecessor_is_not_offered_again(blank_dsn: str) -> None:
+    """The lineage catches what the binding did not declare.
+
+    ``retryable`` defaults to True on the argument that "a needless retry costs
+    only compute". Under BYOK that premise is false — a client-funded retry costs
+    the client money — so a failure that has already been reproduced once must
+    stop advertising itself as worth another run.
+    """
+    binding = _Binding(fail_stage="input", fail_exc=RuntimeError("no input set for this run"))
+
+    run = _claimed(blank_dsn)
+    assert execute(run, binding, dsn=blank_dsn) == EXIT_FAILED
+    first = _row(blank_dsn, run.run_id)
+    assert first.error_json is not None
+    # Attempt 1 is never suppressed: nothing to compare against, and the
+    # optimistic default is right for a genuinely transient first failure.
+    assert first.error_json["retryable"] is True
+    assert "reason" not in first.error_json
+
+    second = _retried(blank_dsn, run.run_id)
+    assert execute(second, binding, dsn=blank_dsn) == EXIT_FAILED
+    after = _row(blank_dsn, second.run_id)
+    assert after.error_json is not None
+    assert after.error_json["retryable"] is False
+    assert after.error_json["reason"] == "deterministic-repeat"
+
+
+@pytest.mark.integration
+def test_an_attempt_that_fails_differently_is_still_retryable(blank_dsn: str) -> None:
+    """NEGATIVE CONTROL. Suppression is evidence-based, not "second attempts are
+    suspect" — a second failure with a different cause has demonstrated nothing
+    deterministic, and refusing it would strand a recoverable run.
+    """
+    run = _claimed(blank_dsn)
+    first = _Binding(fail_stage="input", fail_exc=RuntimeError("no input set for this run"))
+    assert execute(run, first, dsn=blank_dsn) == EXIT_FAILED
+
+    second = _retried(blank_dsn, run.run_id)
+    other = _Binding(fail_stage="input", fail_exc=TimeoutError("upstream took too long"))
+    assert execute(second, other, dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, second.run_id)
+    assert after.error_json is not None
+    assert after.error_json["retryable"] is True
+    assert "reason" not in after.error_json
+
+
+@pytest.mark.integration
+def test_a_failure_says_whose_money_a_retry_would_spend(blank_dsn: str) -> None:
+    """A surface offering "retry" should be able to say who pays before the
+    client presses it. Any client-funded credential makes the answer "client"."""
+    run = _claimed(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        registry.pin_execution_metadata(
+            conn,
+            run.run_id,
+            {"funding": {"openai-api": "client", "serper-api": "operator"}},
+        )
+    assert execute(run, _Binding(fail_stage="input"), dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
+    assert after.error_json["spends"] == "client"
+
+
+@pytest.mark.integration
+def test_a_run_with_no_pinned_snapshot_asserts_nothing_about_cost(blank_dsn: str) -> None:
+    """NEGATIVE CONTROL. A run predating the snapshot cannot be priced, and
+    "operator" defaulted about it would be a claim rather than a reading."""
+    run = _claimed(blank_dsn)
+    assert execute(run, _Binding(fail_stage="input"), dsn=blank_dsn) == EXIT_FAILED
+
+    after = _row(blank_dsn, run.run_id)
+    assert after.error_json is not None
+    assert "spends" not in after.error_json

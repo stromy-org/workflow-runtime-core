@@ -1003,7 +1003,13 @@ def mark_failed_structured(
 ) -> None:
     """Terminal failure with a structured, client-safe payload.
 
-    ``failure`` carries {stage, error_type, message, retryable, correlation_id}.
+    ``failure`` carries {stage, error_type, message, retryable, correlation_id},
+    plus two keys that appear only when the runner could establish them:
+    ``reason`` (why ``retryable`` was narrowed — today only
+    ``"deterministic-repeat"``) and ``spends`` (``"client"``/``"operator"``, whose
+    money a retry would cost). Both are omitted rather than defaulted, because an
+    absent key says "nothing to add" while a defaulted one asserts something.
+
     The traceback stays in server logs keyed by correlation id — a client
     payload is not the place for internal frames or paths.
     """
