@@ -30,7 +30,12 @@ from .auth import (
     resolve_owner_role,
     validate_identifier,
 )
-from .binding import ExecutionBinding, LeaseRenewer, ScopedExecutionBinding
+from .binding import (
+    ConfiguredExecutionBinding,
+    ExecutionBinding,
+    LeaseRenewer,
+    ScopedExecutionBinding,
+)
 from .exceptions import (
     ActiveAttemptExists,
     CheckpointerError,
@@ -111,6 +116,7 @@ __all__: list[str] = [
     "CheckpointSetupMode",
     "CheckpointStoreOutdated",
     "CheckpointerError",
+    "ConfiguredExecutionBinding",
     "CredentialSource",
     "DependencyError",
     "ExecutionBinding",

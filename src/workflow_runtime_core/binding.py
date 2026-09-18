@@ -24,6 +24,7 @@ its type annotations without acquiring the executor extra.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
@@ -85,6 +86,43 @@ class ExecutionBinding(Protocol):
         publishing here and returning ``artifacts_published=True`` means a run
         can never be ``completed`` while its outputs are missing. Raising instead
         leaves the run failed-and-retryable with its workspace intact.
+        """
+        ...
+
+
+@runtime_checkable
+class ConfiguredExecutionBinding(ExecutionBinding, Protocol):
+    """An :class:`ExecutionBinding` that contributes to the *runnable* config.
+
+    OPTIONAL, probed by attribute, same shape as
+    :class:`ScopedExecutionBinding` — a binding without it is untouched.
+
+    **Why this exists at all.** The core owns the runnable config it hands to
+    ``astream``, and built it as ``{"configurable": {...}}`` and nothing else. But
+    LangChain carries callbacks, metadata and tags at the config's TOP level, not
+    under ``configurable``, so there was no channel a binding could put a callback
+    handler on. That is not a gap with a workaround: ``build_context`` returns
+    LangGraph's *runtime context*, a different parameter entirely, so a binding
+    that returned ``{"callbacks": [...]}`` from it was handing the handler to the
+    graph as state and the callback manager never saw it. It ran, it logged
+    nothing, and nothing failed — measured 2026-09-09 on ``gmf-support-agent``
+    (ORG-291): a completed run, ``egress delivered=1``, and zero traces.
+
+    So tracing is the motivating case, but the seam is the runnable config in
+    general — ``callbacks``, ``metadata``, ``tags``, ``run_name``.
+
+    ``configurable`` is RESERVED and raising on it is the point rather than a
+    nicety: it is where ``thread_id`` lives, and a binding that overwrote it would
+    silently detach the run from its own checkpoint thread — resuming a different
+    run's state, or none. A named refusal at the seam beats a corrupted
+    checkpointer downstream.
+    """
+
+    async def build_invoke_config(self, run: RunRecord) -> Mapping[str, Any]:
+        """Top-level runnable-config keys for this run's invocation.
+
+        Return an empty mapping to contribute nothing. May not contain
+        ``configurable`` (see the class docstring).
         """
         ...
 
