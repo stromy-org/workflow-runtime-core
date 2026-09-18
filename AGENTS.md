@@ -130,6 +130,18 @@ A consumer supplies an `ExecutionBinding` (`resolve_graph` / `build_input` /
 graph-resolver callable is deliberately *not* enough — it cannot express a resume
 `Command`, a runtime context, or a terminal artifact projection.
 
+Two OPTIONAL protocols extend it, both probed by attribute so a binding that
+predates them needs no edit: `ScopedExecutionBinding` (`execution_scope`, per-run
+process state) and `ConfiguredExecutionBinding` (`build_invoke_config`, top-level
+runnable-config keys).
+
+**`build_context` is NOT where callbacks go** — it feeds LangGraph's *runtime
+context*, which discards LangChain callbacks silently. Tracing handlers,
+`metadata` and `tags` go on `build_invoke_config`, which the runner merges into
+the config it passes to `astream`. Getting this wrong costs nothing at runtime
+and produces no telemetry, which is exactly how it survived four months
+(ORG-291). `configurable` is reserved — it carries `thread_id`.
+
 ## Development Patterns
 
 - ruff: line-length 120, rules `ASYNC, B, PERF, S, E, F, W, I`

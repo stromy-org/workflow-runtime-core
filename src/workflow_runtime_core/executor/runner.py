@@ -331,6 +331,43 @@ def _execution_scope(
     return cast("AbstractAsyncContextManager[None]", scope(run))
 
 
+#: Runnable-config keys the core owns outright. ``configurable`` carries
+#: ``thread_id``, so a binding that replaced it would detach the run from its own
+#: checkpoint thread — the failure would surface as a resumed run reading someone
+#: else's state, a long way from the binding that caused it.
+RESERVED_INVOKE_CONFIG_KEYS = frozenset({"configurable"})
+
+
+async def _stream_config(
+    binding: ExecutionBinding, run: RunRecord, base: dict[str, Any]
+) -> dict[str, Any]:
+    """``base`` plus whatever the binding contributes to the runnable config.
+
+    Probed by attribute for the same reason
+    :func:`_execution_scope` is: a binding written before
+    :class:`~workflow_runtime_core.binding.ConfiguredExecutionBinding` existed
+    needs no edit, and returning ``base`` unchanged is a real no-op.
+
+    This is the ONLY way a callback handler reaches the callback manager.
+    ``build_context`` feeds LangGraph's runtime context, which is a different
+    parameter and silently discards LangChain callbacks (ORG-291).
+    """
+    build = getattr(binding, "build_invoke_config", None)
+    if build is None:
+        return base
+    extra = await build(run)
+    if not extra:
+        return base
+    reserved = RESERVED_INVOKE_CONFIG_KEYS & set(extra)
+    if reserved:
+        raise ValueError(
+            f"binding contributed reserved runnable-config key(s) "
+            f"{sorted(reserved)} for run {run.run_id}; the core owns these "
+            f"because they carry thread_id"
+        )
+    return {**base, **extra}
+
+
 def execute(
     run: RunRecord,
     binding: ExecutionBinding,
@@ -410,6 +447,17 @@ def execute(
                 context = await binding.build_context(run)
             except Exception as exc:
                 raise _StageError(_declared_stage(exc, "context"), "", exc) from exc
+            # Separate from ``invoke_config`` on purpose: the binding's keys are
+            # per-invocation telemetry (callbacks, metadata, tags), and
+            # ``aget_state`` below is a checkpoint READ. Handing a callback
+            # handler to a state read publishes an observation for something that
+            # never executed a node.
+            try:
+                stream_config = await _stream_config(binding, run, invoke_config)
+            except Exception as exc:
+                raise _StageError(
+                    _declared_stage(exc, "invoke_config"), "", exc
+                ) from exc
             # STREAMED, not invoked, so node completions become durable progress
             # as they happen (see :mod:`.progress`). ``updates`` mode is what makes
             # that affordable: each chunk is the delta of the node that just
@@ -423,7 +471,7 @@ def execute(
                     "AsyncIterator[dict[str, Any]]",
                     compiled.astream(  # type: ignore[attr-defined]
                         payload,
-                        config=invoke_config,
+                        config=stream_config,
                         context=context,
                         durability=DURABILITY,
                         stream_mode="updates",
