@@ -107,6 +107,20 @@ class RunRecord:
     #: is here because :meth:`public` needs it and a second query would race the
     #: row it is projecting.
     execution_metadata_json: dict[str, Any] | None = None
+    #: Whether the row this record was read from HAD the v4 column at all.
+    #:
+    #: ``execution_metadata_json is None`` is two opposite statements wearing the
+    #: same face: a registry that predates v4 has no column to read, and a v4 row
+    #: legitimately holds NULL when the workflow declares no credential
+    #: requirements. A reader that cannot tell them apart has to guess, and the
+    #: guess that looks harmless — "treat it as unpinned" — is the one that spends
+    #: the operator's keys on a client's run (ORG-318).
+    #:
+    #: ``SELECT *`` answers it for free: the key is in the row iff the column
+    #: exists. Defaults to ``True`` because every caller that builds a record by
+    #: hand is by definition on a build that knows about v4; only ``from_row``
+    #: can observe the expansion window, and only it sets this ``False``.
+    execution_metadata_column_present: bool = True
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> RunRecord:
@@ -142,6 +156,7 @@ class RunRecord:
             artifacts_published_at=row.get("artifacts_published_at"),
             input_set_id=_uuid("input_set_id"),
             execution_metadata_json=row.get("execution_metadata_json"),
+            execution_metadata_column_present="execution_metadata_json" in row,
         )
 
     def public(self) -> dict[str, Any]:

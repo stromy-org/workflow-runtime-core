@@ -29,6 +29,7 @@ import re
 import uuid
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, NoReturn, cast
 
 import psycopg
@@ -77,9 +78,7 @@ def dsn_from_env(env_var: str = _DSN_ENV) -> str:
 
 
 @contextmanager
-def connect(
-    dsn: str | None = None, *, auth: str | None = None, autocommit: bool = False
-) -> Generator[DbConnection]:
+def connect(dsn: str | None = None, *, auth: str | None = None, autocommit: bool = False) -> Generator[DbConnection]:
     """Open a registry connection. Commits on clean exit, rolls back on error.
 
     ``autocommit=True`` opts out of that wrapper, and exactly one caller needs
@@ -191,9 +190,7 @@ CORE_EVENT_KINDS = frozenset(
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
-def record_event(
-    conn: DbConnection, run_id: str, kind: str, detail: dict[str, Any] | None = None
-) -> None:
+def record_event(conn: DbConnection, run_id: str, kind: str, detail: dict[str, Any] | None = None) -> None:
     """Append one consumer-owned event to a run's durable timeline.
 
     This exists so application code stops reaching for ``_emit``. A private name
@@ -296,12 +293,7 @@ def create_run(
             return existing
 
     data_plane = _data_plane_live(conn)
-    lineage_requested = (
-        workspace_id is not None
-        or retry_of is not None
-        or attempt_no != 1
-        or input_set_id is not None
-    )
+    lineage_requested = workspace_id is not None or retry_of is not None or attempt_no != 1 or input_set_id is not None
     if lineage_requested and not data_plane:
         raise SchemaVersionMismatch(
             "workspace/attempt lineage requires schema v2; the live registry is "
@@ -387,6 +379,117 @@ def create_run(
     return RunRecord.from_row(row)
 
 
+#: How :func:`create_retry` treats every field of a :class:`RunRecord`.
+#:
+#: Written down as data because the hand-enumerated version is what caused
+#: ORG-318: schema v4 added ``execution_metadata_json``, :func:`create_run`
+#: learned it, and this function's inheritance list did not — so every retry
+#: silently dropped the credential snapshot that exists precisely to stop a
+#: retry being re-funded. Nothing about that was specific to credentials; the
+#: next column added to ``runs`` would have gone the same way.
+#:
+#: ``tests/unit/test_retry_lineage.py`` asserts these three sets partition
+#: ``RunRecord``'s fields exactly, so a new field fails that test until someone
+#: states which of the three it is. The test is the point — a comment saying
+#: "remember to update create_retry" is what we had.
+#:
+#: **Inherited** — properties of the WORK, identical across every attempt of it.
+RETRY_INHERITED_FIELDS = frozenset(
+    {
+        "workflow",
+        "client_slug",
+        "config_json",
+        "image_tag",
+        "job_template_json",
+        "workspace_id",
+        "input_set_id",
+        "execution_metadata_json",
+    }
+)
+#: **Per-attempt** — observations about ONE attempt, so a new attempt starts
+#: without them. ``idempotency_key`` is here deliberately: inheriting it would
+#: make ``create_run`` return the parent (see :func:`create_retry`).
+RETRY_PER_ATTEMPT_FIELDS = frozenset(
+    {
+        "status",
+        "created_at",
+        "updated_at",
+        "interrupt_payload",
+        "error",
+        "error_json",
+        "artifacts_json",
+        "artifacts_published_at",
+        "progress_json",
+        "idempotency_key",
+        "dispatch_id",
+        "lease_owner",
+        "lease_expires_at",
+        "heartbeat_at",
+        "delivery_count",
+    }
+)
+#: **Minted** — derived fresh for this attempt from the lineage itself.
+RETRY_MINTED_FIELDS = frozenset({"run_id", "thread_id", "retry_of", "attempt_no"})
+
+
+def _inherit_execution_snapshot(conn: DbConnection, *, parent: RunRecord, attempt_id: str) -> dict[str, Any] | None:
+    """Carry the parent's pinned execution snapshot onto a new attempt.
+
+    The snapshot is LINEAGE, not observation. It is written once at creation and
+    is immutable "for the life of the run and every attempt of it", because
+    entitlements and contracts are editable by design and a retry priced against
+    an edit made since the failure would charge a client who approved neither
+    price. That sentence was already in the facade that writes it; only the
+    second half of it was ever implemented.
+
+    A retry that reaches a runner without the snapshot reads as an *unpinned*
+    run, and an unpinned run binds nothing — no scrub, no injection, so the
+    attempt spends whatever ambient keys the job happens to carry. That is the
+    silent fall-through to operator spend this whole plane exists to close, and
+    it is what ORG-318 measured on attempts 2 and 3 of ``7157f728``.
+
+    **Only ``pinned`` travels.** ``credential_sources`` and ``degradations`` are
+    the runner's record of what an attempt actually did. Copying them forward
+    would fabricate evidence for an attempt that has not run yet — a worse
+    failure than the one being fixed, because it reads as proof.
+
+    **The column is written even when the parent has none**, as
+    ``{"pinned": None}``. That is what makes a later absence diagnostic: under a
+    v4 registry a retry row ALWAYS carries the column, so a consumer that finds
+    ``NULL`` on a row whose ``retry_of`` is set knows the snapshot was *dropped*
+    rather than never existing, and can refuse instead of guessing. Those two
+    states looked identical before, and a branch that cannot tell them apart is
+    the trap this fix exists to remove — so it is closed here rather than
+    deleted.
+
+    Returns the column now stored, or ``None`` on a registry below v4, where
+    there is no column to inherit and a retry behaves exactly as it always did.
+    """
+    if parent.execution_metadata_column_present is False:
+        return None
+    stored = parent.execution_metadata_json or {}
+    pinned = stored.get("pinned")
+    payload: dict[str, Any] = {"pinned": pinned if isinstance(pinned, dict) else None}
+    try:
+        # Inside its own savepoint: PostgreSQL aborts the WHOLE surrounding
+        # transaction on a failed statement, and ``create_retry`` still has an
+        # event to emit after this. Unreachable in practice — the column-presence
+        # check above already returned — but an except branch that poisons the
+        # caller's transaction is not a safety net.
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET execution_metadata_json = %s, updated_at = now() "
+                "WHERE run_id = %s AND execution_metadata_json IS NULL",
+                (json.dumps(payload), attempt_id),
+            )
+    except psycopg.errors.UndefinedColumn:
+        # A v3-or-below registry, whose parent row therefore carried no column
+        # either. Nothing to inherit, and a retry there is as correct as it has
+        # always been — so this is a skip, not the named v4 error.
+        return None
+    return payload
+
+
 def create_retry(
     conn: DbConnection,
     *,
@@ -411,6 +514,12 @@ def create_retry(
     * **Same input set.** The evidence was verified and attached once; re-attaching
       would re-run an ownership check that already passed and could now fail for an
       unrelated reason (an expired session).
+    * **Same pinned execution snapshot.** How the work is funded was decided once,
+      at creation, against the entitlements of that moment. Re-deriving it per
+      attempt — or dropping it, which amounts to the same thing at the runner —
+      lets an entitlement edited between a failure and its retry move who pays,
+      against a client who approved neither price. Only the ``pinned`` block
+      travels; see :func:`_inherit_execution_snapshot`.
     * **``attempt_no`` from the whole lineage**, not ``parent.attempt_no + 1``.
       Retrying attempt 2 twice — legitimate, if the first retry also failed —
       would otherwise mint two attempt 3s and make the audit trail ambiguous.
@@ -445,8 +554,7 @@ def create_retry(
         # and makes it NOT NULL), so this is the v1 case stated plainly rather
         # than a KeyError deep in the INSERT.
         raise SchemaVersionMismatch(
-            f"run {run_id} carries no workspace; retry lineage requires schema "
-            "v2. Run `wrc migrate` first."
+            f"run {run_id} carries no workspace; retry lineage requires schema v2. Run `wrc migrate` first."
         )
 
     with conn.cursor() as cur:
@@ -469,6 +577,10 @@ def create_retry(
         attempt_no=int(highest) + 1,
         input_set_id=parent.input_set_id,
     )
+    # Part of the lineage listed above, not a separate feature bolted on after it.
+    inherited = _inherit_execution_snapshot(conn, parent=parent, attempt_id=attempt.run_id)
+    if inherited is not None:
+        attempt = replace(attempt, execution_metadata_json=inherited)
     # Recorded against the PARENT as well, so the failed run's own event trail says
     # what became of it. An operator reading a failed run should not have to search
     # for a child to find out whether anyone retried it.
@@ -599,18 +711,15 @@ def set_input_set(conn: DbConnection, run_id: str, input_set_id: str) -> None:
 
 # --- execution metadata (schema v4, ORG-PLAN-206) -----------------------------
 
-def _require_execution_metadata_column(
-    exc: psycopg.errors.UndefinedColumn, feature: str
-) -> NoReturn:
+
+def _require_execution_metadata_column(exc: psycopg.errors.UndefinedColumn, feature: str) -> NoReturn:
     raise SchemaVersionMismatch(
         f"{feature} requires schema v4 (execution metadata); the live registry "
         "predates it. Run `wrc migrate` before enabling this path."
     ) from exc
 
 
-def pin_execution_metadata(
-    conn: DbConnection, run_id: str, metadata: dict[str, Any]
-) -> dict[str, Any]:
+def pin_execution_metadata(conn: DbConnection, run_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
     """Write a run's server-derived execution snapshot exactly once.
 
     Compare-and-set against *absent*: the first writer wins, a second writer of
@@ -691,9 +800,7 @@ def read_execution_metadata(conn: DbConnection, run_id: str) -> dict[str, Any] |
     return dict(cast("dict[str, Any]", pinned))
 
 
-def record_credential_sources(
-    conn: DbConnection, run_id: str, sources: dict[str, str], *, attempt_no: int = 1
-) -> None:
+def record_credential_sources(conn: DbConnection, run_id: str, sources: dict[str, str], *, attempt_no: int = 1) -> None:
     """Record WHERE each credential came from, per attempt. Never any value.
 
     Written by the runner once it has resolved the run's credentials, so an
@@ -786,16 +893,12 @@ def record_degradations(
     for entry in entries:
         kind = entry.get("kind")
         if kind not in DEGRADATION_KINDS:
-            raise RegistryError(
-                f"unknown degradation kind {kind!r}; declare it in DEGRADATION_KINDS"
-            )
+            raise RegistryError(f"unknown degradation kind {kind!r}; declare it in DEGRADATION_KINDS")
         # Annotated ``str``, checked anyway — the same reasoning as
         # ``record_credential_sources``: the annotation is advice, and this is
         # the only thing between a caller's mistake and a provider key landing
         # in a column that gets projected to the client.
-        if not all(
-            isinstance(value, str) for value in cast("Mapping[str, object]", entry).values()
-        ):
+        if not all(isinstance(value, str) for value in cast("Mapping[str, object]", entry).values()):
             raise RegistryError("degradation fields must be strings, never values")
         cleaned.append(dict(entry))
 
@@ -918,9 +1021,7 @@ def claim_dispatch(
     return RunRecord.from_row(claimed)
 
 
-def renew_lease(
-    conn: DbConnection, *, run_id: str, owner: str, lease_seconds: int
-) -> bool:
+def renew_lease(conn: DbConnection, *, run_id: str, owner: str, lease_seconds: int) -> bool:
     """Extend this worker's lease. False means the lease was lost.
 
     A worker that loses its lease must stop: something else has been told it may
@@ -949,8 +1050,7 @@ def release_lease(conn: DbConnection, run_id: str) -> None:
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, "
-                "updated_at = now() WHERE run_id = %s",
+                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE run_id = %s",
                 (run_id,),
             )
     except psycopg.errors.UndefinedColumn as exc:
@@ -990,17 +1090,14 @@ def record_progress(conn: DbConnection, run_id: str, progress: dict[str, Any]) -
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "UPDATE runs SET progress_json = %s, heartbeat_at = now(), "
-                "updated_at = now() WHERE run_id = %s",
+                "UPDATE runs SET progress_json = %s, heartbeat_at = now(), updated_at = now() WHERE run_id = %s",
                 (json.dumps(progress), run_id),
             )
     except psycopg.errors.UndefinedColumn as exc:
         _require_data_plane_column(exc, "record_progress")
 
 
-def mark_failed_structured(
-    conn: DbConnection, run_id: str, failure: dict[str, Any]
-) -> None:
+def mark_failed_structured(conn: DbConnection, run_id: str, failure: dict[str, Any]) -> None:
     """Terminal failure with a structured, client-safe payload.
 
     ``failure`` carries {stage, error_type, message, retryable, correlation_id},
@@ -1046,10 +1143,7 @@ def mark_paused(conn: DbConnection, run_id: str, interrupt_payload: Any) -> None
             "WHERE run_id = %s"
         )
     else:
-        sql = (
-            "UPDATE runs SET status = %s, interrupt_payload = %s, updated_at = now() "
-            "WHERE run_id = %s"
-        )
+        sql = "UPDATE runs SET status = %s, interrupt_payload = %s, updated_at = now() WHERE run_id = %s"
     with conn.cursor() as cur:
         cur.execute(sql, (RunStatus.PAUSED.value, json.dumps(interrupt_payload), run_id))
     _emit(conn, run_id, "paused")
@@ -1094,8 +1188,7 @@ def mark_completed(
             )
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE runs SET status = %s, artifacts_json = %s, updated_at = now() "
-                "WHERE run_id = %s",
+                "UPDATE runs SET status = %s, artifacts_json = %s, updated_at = now() WHERE run_id = %s",
                 (
                     RunStatus.COMPLETED.value,
                     json.dumps(artifacts) if artifacts is not None else None,
@@ -1136,9 +1229,7 @@ def request_resume(conn: DbConnection, run_id: str, resume_payload: Any) -> RunR
         if row is None:
             raise RegistryError(f"run {run_id} not found")
         if row["status"] != RunStatus.PAUSED.value:
-            raise RegistryError(
-                f"run {run_id} is {row['status']}, not paused — nothing to resume"
-            )
+            raise RegistryError(f"run {run_id} is {row['status']}, not paused — nothing to resume")
         config = dict(row["config_json"] or {})
         config[RESUME_KEY] = resume_payload
         cur.execute(
@@ -1325,8 +1416,7 @@ def stale_terminal_thread_ids(
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT thread_id FROM runs WHERE status = ANY(%s) "
-            "AND updated_at < now() - make_interval(days => %s)",
+            "SELECT thread_id FROM runs WHERE status = ANY(%s) AND updated_at < now() - make_interval(days => %s)",
             ([s.value for s in TERMINAL_STATUSES], older_than_days),
         )
         return [str(row["thread_id"]) for row in cur.fetchall()]
@@ -1357,8 +1447,7 @@ def prune_terminal_runs(conn: DbConnection, *, older_than_days: int = 30) -> int
     if not _data_plane_live(conn):
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM runs WHERE status = ANY(%s) "
-                "AND updated_at < now() - make_interval(days => %s)",
+                "DELETE FROM runs WHERE status = ANY(%s) AND updated_at < now() - make_interval(days => %s)",
                 (terminal, older_than_days),
             )
             return cur.rowcount
