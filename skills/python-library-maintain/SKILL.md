@@ -46,11 +46,24 @@ workflow-runtime-core/
 ### Bump version + release
 
 1. Edit `[project].version` in `pyproject.toml` on `main`.
-2. Update `CHANGELOG.md` if present.
-3. Commit via `/conventional-commit`.
-4. `git tag vX.Y.Z && git push --tags`.
-5. CI runs `release.yml`, builds sdist+wheel, publishes a GitHub Release, and fires a `repository_dispatch` into each `consumer_repos_to_notify` to open a pin-bump PR — authenticated by the org `stromy-ci` GitHub App token (org secrets `CI_APP_ID`/`CI_APP_PRIVATE_KEY`).
-6. `notify-parent.yml` fires a `submodule-bumped` event into stromy-org; the daily cron opens a pointer-bump PR if the dispatch was missed.
+2. Relock in the same commit: `uv lock`. The version lives in `uv.lock` too, and
+   the release refuses a lockfile that disagrees with `pyproject.toml`.
+3. Update `CHANGELOG.md` if present.
+4. Commit via `/conventional-commit`; land it on `main` the normal way.
+5. Dispatch the release: `gh workflow run release.yml` (or Actions -> Release ->
+   Run workflow). **Never type a tag.** The tag is an OUTPUT of that workflow,
+   computed from `[project].version` — it is created only after the
+   default-branch check, the main-ancestry check, lint, types, tests, the
+   lockfile check and the build have all passed. A tag that disagreed with
+   `pyproject.toml` is now unrepresentable rather than merely detected, and
+   dispatching without having bumped the version is refused before anything is
+   built. Use `-f dry_run=true` to run every gate and stop short of tagging.
+
+**Consumer pins are not your job.** stromy-org's `internal-lib-pins.yml`
+reconciles every consumer daily: it derives the graph from each repo's own
+`[tool.uv.sources]` and opens the bump PRs, and it resolves `releases/latest`
+rather than `tags` — so a tag that never became a release can never become
+anyone's pin. Releasing is the whole task.
 
 ### Refresh AGENTS / re-render
 
