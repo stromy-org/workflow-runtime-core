@@ -35,9 +35,16 @@ uv run pytest tests/contract
 
 This library is consumed by downstream repos via `[tool.uv.sources]` git+URL pins. To cut a release:
 
-1. Bump `[project].version` in `pyproject.toml` on `main`.
-2. `git tag vX.Y.Z && git push --tags`
-3. CI builds + publishes a GitHub Release; `notify-parent.yml` fires a `submodule-bumped` event into stromy-org.
+1. Bump `[project].version` in `pyproject.toml` on `main` — a normal reviewed PR. Relock (`uv lock`) in the same commit.
+2. Actions -> **Release** -> *Run workflow* (or `gh workflow run release.yml`).
+
+**You never type a tag.** The workflow derives it from `[project].version`, runs
+every gate — default branch, main-ancestry, lint, types, tests, lockfile, build —
+and creates the tag and the GitHub Release only if they all pass. Dispatching
+without having bumped the version is refused before anything is built.
+
+Consumer pins are not your job: stromy-org's `internal-lib-pins.yml` reconciles
+them daily from every consumer's own `[tool.uv.sources]`.
 
 See `stromy-org/infra-docs/ai/internal-libs.md` for the full release pattern.
 
