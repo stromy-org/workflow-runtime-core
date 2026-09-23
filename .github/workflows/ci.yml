@@ -28,7 +28,6 @@ on:
     branches: [main]
 
 jobs:
-<<<<<<< before updating
   quality:
     runs-on: ubuntu-latest
     steps:
@@ -116,23 +115,3 @@ jobs:
         # above there should be none, so any skip line here is a signal that a
         # fixture quietly stopped reaching its engine.
         run: uv run pytest tests/integration -v -ra
-=======
-  python-ci:
-    # ci-dedup (inside the reusable workflow) reads the merged PR behind a push
-    # and that PR's workflow runs. The org default token grants contents+packages
-    # only, so without these the action 403s on every push and silently never
-    # skips — the checks then run twice per change, which is the cost it exists to
-    # remove. A called workflow inherits this job's grant and can only downgrade
-    # it, so it has to be declared here rather than in ci-python.yml.
-    permissions:
-      contents: read
-      packages: read
-      pull-requests: read
-      actions: read
-    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
-    with:
-      source_package: "src/workflow_runtime_core"
-    # Forward the org stromy-ci App secrets (CI_APP_ID / CI_APP_PRIVATE_KEY)
-    # so the reusable workflow can clone private deps. No-op if absent.
-    secrets: inherit
->>>>>>> after updating
