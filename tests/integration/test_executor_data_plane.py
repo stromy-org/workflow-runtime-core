@@ -714,3 +714,109 @@ def test_a_consumer_supplied_run_object_without_the_v2_fields_still_records(
     assert after.error_json is not None
     assert after.error_json["retryable"] is True
     assert after.error_json["message"] == "boom"
+
+
+# --- 4. a wall-clock ceiling bounds the execution (ORG-PLAN-345) ---------------
+
+
+@pytest.mark.integration
+def test_a_run_past_its_deadline_fails_with_deadline_exceeded_and_a_released_lease(
+    blank_dsn: str,
+) -> None:
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(sleep=30, chunks=[])
+    renewer = _Renewer(grants=10_000, interval_seconds=0.01)
+
+    assert execute(run, _Binding(graph), dsn=blank_dsn, lease=renewer, deadline_seconds=0.05) == EXIT_FAILED
+
+    # The graph was cancelled AND awaited, not abandoned.
+    assert graph.observed["cancelled"] is True
+    after = _row(blank_dsn, run.run_id)
+    assert after.status is RunStatus.FAILED
+    assert after.error_json is not None
+    assert after.error_json["error_type"] == "deadline_exceeded"
+    assert after.error_json["stage"] == "deadline"
+    assert after.error_json["retryable"] is False
+    # The terminal write released the lease: no stranded worker.
+    assert after.lease_owner is None
+    assert after.lease_expires_at is None
+
+
+@pytest.mark.integration
+def test_a_run_inside_its_deadline_is_unaffected(blank_dsn: str) -> None:
+    run = _claimed(blank_dsn)
+    assert execute(run, _Binding(), dsn=blank_dsn, deadline_seconds=60) == EXIT_OK
+    assert _row(blank_dsn, run.run_id).status is RunStatus.COMPLETED
+
+
+@pytest.mark.integration
+def test_the_declared_spend_ceiling_is_the_deadline(blank_dsn: str) -> None:
+    """The ceiling an attempt was started under bounds that attempt; a binding's
+    own default applies only when none was declared."""
+    run = _claimed(blank_dsn)
+    from workflow_runtime_core.executor.runner import _deadline_seconds
+
+    with registry.connect(blank_dsn) as conn:
+        registry.record_spend_ceiling(conn, run.run_id, 3)
+        declared = registry.get_run(conn, run.run_id)
+    assert declared is not None
+
+    class _Defaulting(_Binding):
+        def default_deadline_seconds(self, run: RunRecord) -> float | None:
+            return 7.0
+
+    assert _deadline_seconds(declared, _Defaulting(), None) == (180.0, 3.0)
+    assert _deadline_seconds(run, _Defaulting(), None) == (7.0, None)
+    assert _deadline_seconds(run, _Binding(), None) == (None, None)
+    assert _deadline_seconds(declared, _Defaulting(), 1.5) == (1.5, None)
+
+
+@pytest.mark.integration
+def test_a_lost_lease_still_beats_the_deadline(blank_dsn: str) -> None:
+    """The deadline wraps the graph beneath the lease: losing the lease stops the
+    run and records nothing, deadline or not."""
+    run = _claimed(blank_dsn)
+    graph = _FakeGraph(sleep=30, chunks=[])
+    assert (
+        execute(run, _Binding(graph), dsn=blank_dsn, lease=_Renewer(grants=1), deadline_seconds=60)
+        == EXIT_CLAIM_LOST
+    )
+    assert graph.observed["cancelled"] is True
+    assert _row(blank_dsn, run.run_id).status is RunStatus.RUNNING
+
+
+@pytest.mark.integration
+def test_the_workers_cancel_acknowledgement_is_owner_scoped_and_emits_an_event(
+    blank_dsn: str,
+) -> None:
+    import uuid
+
+    dispatch = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        apply_migrations(conn)
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_dispatch(conn, run.run_id, dispatch)
+        claimed = registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="w1", lease_seconds=300
+        )
+        assert claimed is not None
+        registry.cancel_run(conn, run.run_id)
+
+        # Not the lease holder, or the wrong attempt: nothing is released.
+        assert not registry.release_cancelled_attempt_lease(
+            conn, run_id=run.run_id, attempt_no=claimed.attempt_no, owner="intruder"
+        )
+        assert not registry.release_cancelled_attempt_lease(
+            conn, run_id=run.run_id, attempt_no=claimed.attempt_no + 1, owner="w1"
+        )
+        stuck = registry.get_run(conn, run.run_id)
+        assert stuck is not None
+        assert stuck.public()["cancellation"] == "requested"
+
+        assert registry.release_cancelled_attempt_lease(
+            conn, run_id=run.run_id, attempt_no=claimed.attempt_no, owner="w1"
+        )
+        done = registry.get_run(conn, run.run_id)
+        assert done is not None
+        assert done.public()["cancellation"] == "confirmed"
+        assert "lease_released" in [e["kind"] for e in registry.public_events(conn, run.run_id)]

@@ -1113,6 +1113,35 @@ def release_lease(conn: DbConnection, run_id: str) -> None:
         _require_data_plane_column(exc, "release_lease")
 
 
+def release_cancelled_attempt_lease(
+    conn: DbConnection, *, run_id: str, attempt_no: int, owner: str
+) -> bool:
+    """The worker's own acknowledgement that it has stopped after a cancellation.
+
+    Owner-scoped and attempt-scoped: only the worker that held the lease, for the
+    attempt that was cancelled, can clear it. Returns ``True`` and emits
+    ``lease_released`` when it did. A status flip alone is only the request;
+    this is the one write a caller can read as "the process actually stopped".
+    """
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+                 WHERE run_id = %s AND attempt_no = %s AND status = %s AND lease_owner = %s
+                RETURNING run_id
+                """,
+                (run_id, attempt_no, RunStatus.CANCELLED.value, owner),
+            )
+            released = cur.fetchone() is not None
+            if released:
+                _emit(conn, run_id, "lease_released")
+            return released
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_data_plane_column(exc, "release_cancelled_attempt_lease")
+
+
 def requeue_expired_lease(conn: DbConnection, run_id: str) -> bool:
     """Return a crashed run to ``queued`` once its lease has lapsed."""
     try:

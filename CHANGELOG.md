@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.0
+
+ORG-PLAN-345 — a run is bounded by the wall-clock ceiling its attempt was started under.
+
+- `execute()` bounds each execution by a deadline: an explicit `deadline_seconds`, else the attempt's declared spend ceiling (`record_spend_ceiling`), else the binding's optional `default_deadline_seconds(run)` (`DeadlineExecutionBinding`). On expiry the graph is cancelled **and awaited**, the run is recorded `failed` with `error_type: deadline_exceeded` (stage `deadline`, not retryable) and the lease is released by that same write. The deadline sits beneath the lease, so a lost lease still stops the run and records nothing. A paused run's next execution has its own bound.
+- New `exceptions.DeadlineExceeded`.
+- `registry.release_cancelled_attempt_lease(conn, run_id=, attempt_no=, owner=)` moves in from Stromy: the worker's owner- and attempt-scoped acknowledgement after a cancellation, which now emits `lease_released`.
+
 ## 0.14.0
 
 ORG-PLAN-345 — a caller can now tell a cancellation that was *asked for* from one the worker has *acknowledged*.

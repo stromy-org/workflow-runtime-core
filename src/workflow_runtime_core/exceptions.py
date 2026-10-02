@@ -89,6 +89,20 @@ class StageFailure(WorkflowRuntimeCoreError, RuntimeError):
         self.stage = stage
 
 
+class DeadlineExceeded(WorkflowRuntimeCoreError, RuntimeError):
+    """A run outlived the wall-clock ceiling its attempt was started under.
+
+    Carries its own ``stage`` / ``error_type`` / ``retryable`` so the runner
+    records it through the ordinary failure path: a ceiling is a bound the
+    operator chose, and an identical rerun hits the identical bound, so a retry
+    must restate a ceiling rather than be offered as worth repeating.
+    """
+
+    stage = "deadline"
+    error_type = "deadline_exceeded"
+    retryable = False
+
+
 class LeaseLost(WorkflowRuntimeCoreError, RuntimeError):
     """This runner's single-writer lease expired or was taken over.
 
