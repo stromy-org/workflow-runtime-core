@@ -456,3 +456,88 @@ def test_v2_only_calls_fail_with_the_named_error_on_v1(blank_dsn: str) -> None:
         # And the connection is still usable after every refusal — the guards
         # must not leave the transaction poisoned.
         assert registry.get_run(conn, run.run_id) is not None
+
+
+@pytest.mark.integration
+def test_cancellation_is_requested_until_the_worker_releases_its_lease(blank_dsn: str) -> None:
+    """The acknowledgement a caller can trust (ORG-PLAN-345).
+
+    ``cancel_run`` only flips the status, so the projection must read
+    ``requested`` while the worker's lease is live, and ``confirmed`` only after
+    ``release_lease`` — which is also what emits the ``lease_released`` event.
+    The public timeline must never carry the ``claimed`` event's owner or
+    dispatch id.
+    """
+    _migrated(blank_dsn)
+    dispatch = str(uuid.uuid4())
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.set_dispatch(conn, run.run_id, dispatch)
+        registry.claim_dispatch(
+            conn, run_id=run.run_id, dispatch_id=dispatch, owner="worker-secret-1", lease_seconds=300
+        )
+        cancelled = registry.cancel_run(conn, run.run_id)
+        assert cancelled.public()["cancellation"] == "requested"
+
+        registry.release_lease(conn, run.run_id)
+        settled = registry.get_run(conn, run.run_id)
+        assert settled is not None
+        assert settled.public()["cancellation"] == "confirmed"
+
+        events = registry.public_events(conn, run.run_id)
+        kinds = [e["kind"] for e in events]
+        assert kinds.index("cancelled") < kinds.index("lease_released")
+        assert set(events[0]) == {"kind", "created_at"}
+        rendered = str(events)
+        assert "worker-secret-1" not in rendered
+        assert dispatch not in rendered
+
+
+@pytest.mark.integration
+def test_releasing_a_lease_on_a_live_run_emits_no_acknowledgement(blank_dsn: str) -> None:
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.release_lease(conn, run.run_id)
+        assert "lease_released" not in [e["kind"] for e in registry.public_events(conn, run.run_id)]
+
+
+@pytest.mark.integration
+def test_public_events_drop_unlisted_kinds_and_cap_the_window(blank_dsn: str) -> None:
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.record_event(conn, run.run_id, "consumer_private", {"k": "v"})
+        for _ in range(registry.PUBLIC_EVENT_LIMIT + 5):
+            registry._emit(conn, run.run_id, "paused")  # noqa: SLF001
+        events = registry.public_events(conn, run.run_id)
+        assert len(events) == registry.PUBLIC_EVENT_LIMIT
+        assert "consumer_private" not in [e["kind"] for e in events]
+
+
+@pytest.mark.integration
+def test_a_retry_inherits_the_pin_but_never_the_spend_ceiling(blank_dsn: str) -> None:
+    """A retry must restate its own bound (ORG-PLAN-345)."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.pin_execution_metadata(conn, run.run_id, {"credential_policy": "operator"})
+        registry.record_spend_ceiling(conn, run.run_id, 15)
+        registry.claim_run(conn, run.run_id)
+        registry.mark_failed(conn, run.run_id, "boom")
+        parent = registry.get_run(conn, run.run_id)
+        assert parent is not None
+        assert parent.public()["usage"] == {"status": "reserved", "max_runtime_minutes": 15}
+
+        attempt = registry.create_retry(conn, run_id=run.run_id)
+        assert attempt.public()["usage"] == {"status": "unavailable"}
+        assert registry.read_execution_metadata(conn, attempt.run_id) == {"credential_policy": "operator"}
+
+        registry.record_spend_ceiling(conn, attempt.run_id, 30)
+        stored = registry.get_run(conn, attempt.run_id)
+        assert stored is not None
+        assert stored.public()["usage"]["max_runtime_minutes"] == 30
+        # The pin survives the ceiling write.
+        assert registry.read_execution_metadata(conn, attempt.run_id) == {"credential_policy": "operator"}
+        with pytest.raises(registry.RegistryError):
+            registry.record_spend_ceiling(conn, attempt.run_id, 0)

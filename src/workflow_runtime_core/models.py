@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 
 class RunStatus(StrEnum):
@@ -214,7 +214,67 @@ class RunRecord:
         execution = public_execution_metadata(self.execution_metadata_json)
         if execution:
             payload["execution"] = execution
+        payload["cancellation"] = self.cancellation_state()
+        payload["usage"] = self.usage()
         return payload
+
+    def spend_ceiling_minutes(self) -> int | None:
+        """The wall-clock ceiling this attempt was started under, or ``None``.
+
+        Stored beside the pinned snapshot, never inside it: the pin is inherited
+        verbatim by a retry, and a ceiling must not be. Each attempt declares its
+        own (``registry.record_spend_ceiling``), so a retry that was not given
+        one reads ``None`` rather than the parent's bound.
+        """
+        raw = self.execution_metadata_json
+        ceiling: Any = raw.get("spend_ceiling") if raw is not None else None
+        if not isinstance(ceiling, dict):
+            return None
+        minutes: Any = cast("dict[str, Any]", ceiling).get("max_runtime_minutes")
+        return minutes if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0 else None
+
+    def usage(self) -> dict[str, Any]:
+        """What is known about this run's usage — never a figure nobody measured.
+
+        ``reserved`` states the wall-clock ceiling the attempt was bounded by; it
+        is a time bound, not a currency guarantee. ``unavailable`` is the answer
+        for everything else, including every row that predates telemetry.
+        ``provider_reported`` is reserved vocabulary for a runner that emits
+        measured usage; nothing here ever produces a zero or a cost total.
+        """
+        minutes = self.spend_ceiling_minutes()
+        if minutes is not None:
+            return {"status": "reserved", "max_runtime_minutes": minutes}
+        return {"status": "unavailable"}
+
+    def cancellation_state(self, now: datetime | None = None) -> str:
+        """Whether a cancellation is only asked for or the worker has stood down.
+
+        ``cancel_run`` flips the status and nothing else, so ``cancelled`` alone
+        cannot say whether work is still running (a prior run reported stopped
+        kept going for ten hours). The worker-owned lease is the witness: the
+        worker clears it on its way out, so a cleared lease is the
+        acknowledgement and a live one is a request still in flight. This reads
+        only columns the projection already holds and never emits them.
+
+        * ``not_requested`` — the run is not cancelled.
+        * ``confirmed`` — cancelled and no worker holds the lease (includes runs
+          cancelled while queued or paused, which truthfully had no worker).
+        * ``requested`` — cancelled, lease still held and unexpired.
+        * ``unavailable`` — cancelled but the registry cannot say: a lapsed
+          lease that was never released (the worker died), or a pre-v2 row with
+          no lease columns. Escalate; never read it as confirmed.
+        """
+        if self.status != RunStatus.CANCELLED:
+            return "not_requested"
+        if self.workspace_id is None:
+            return "unavailable"
+        if self.lease_owner is None:
+            return "confirmed"
+        expires = self.lease_expires_at
+        if expires is not None and expires > (now or utcnow()):
+            return "requested"
+        return "unavailable"
 
 
 #: Historical name used by the extracted Stromy runtime. Kept so consumer code

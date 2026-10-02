@@ -175,3 +175,79 @@ def test_the_attempt_block_gates_on_workspace_not_attempt_no() -> None:
     attempt. ``workspace_id`` is NOT NULL from migration 0002 onward."""
     assert "attempt" not in RunRecord.from_row(_row(attempt_no=1)).public()
     assert "attempt" in RunRecord.from_row(_v2_row(attempt_no=1)).public()
+
+
+# --- cancellation state (ORG-PLAN-345) ----------------------------------------
+
+_LATER = datetime(2026, 8, 1, 12, 5, tzinfo=UTC)
+
+
+def _cancel_state(**overrides: object) -> str:
+    record = RunRecord.from_row(_v2_row(status="cancelled", **overrides))
+    return record.cancellation_state(now=_NOW)
+
+
+@pytest.mark.unit
+def test_a_run_that_was_not_cancelled_reports_not_requested() -> None:
+    assert RunRecord.from_row(_v2_row(status="running")).public()["cancellation"] == "not_requested"
+
+
+@pytest.mark.unit
+def test_a_cancelled_run_with_a_live_lease_is_only_requested() -> None:
+    """Status alone is the request; the worker has not stood down yet."""
+    assert _cancel_state(lease_owner="runner-7", lease_expires_at=_LATER) == "requested"
+
+
+@pytest.mark.unit
+def test_a_cancelled_run_is_confirmed_only_once_the_lease_is_released() -> None:
+    assert _cancel_state(lease_owner=None, lease_expires_at=None) == "confirmed"
+
+
+@pytest.mark.unit
+def test_a_lapsed_unreleased_lease_is_unavailable_never_confirmed() -> None:
+    """A dead worker never clears its lease; reading that as confirmed would lie."""
+    assert _cancel_state(lease_owner="runner-7", lease_expires_at=_NOW) == "unavailable"
+    assert _cancel_state(lease_owner="runner-7", lease_expires_at=None) == "unavailable"
+
+
+@pytest.mark.unit
+def test_a_pre_v2_cancelled_row_is_unavailable() -> None:
+    record = RunRecord.from_row(_row(status="cancelled"))
+    assert record.public()["cancellation"] == "unavailable"
+
+
+@pytest.mark.unit
+def test_the_cancellation_state_still_hides_the_lease() -> None:
+    payload = json.dumps(
+        RunRecord.from_row(_v2_row(status="cancelled", lease_expires_at=_LATER)).public(), default=str
+    )
+    for secret in ("lease_owner", "runner-7", "lease_expires_at", "dispatch_id"):
+        assert secret not in payload
+
+
+# --- usage vocabulary (ORG-PLAN-345) ------------------------------------------
+
+
+@pytest.mark.unit
+def test_usage_is_unavailable_without_a_declared_ceiling() -> None:
+    assert RunRecord.from_row(_v2_row()).public()["usage"] == {"status": "unavailable"}
+
+
+@pytest.mark.unit
+def test_usage_reports_the_reserved_ceiling_never_a_cost() -> None:
+    raw = {"pinned": {"credential_policy": "operator"}, "spend_ceiling": {"max_runtime_minutes": 20}}
+    usage = RunRecord.from_row(_v2_row(execution_metadata_json=raw)).public()["usage"]
+    assert usage == {"status": "reserved", "max_runtime_minutes": 20}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", [0, -3, True, "20", None])
+def test_a_malformed_ceiling_reads_unavailable(bad: object) -> None:
+    raw = {"spend_ceiling": {"max_runtime_minutes": bad}}
+    assert RunRecord.from_row(_v2_row(execution_metadata_json=raw)).public()["usage"] == {"status": "unavailable"}
+
+
+@pytest.mark.unit
+def test_the_ceiling_never_leaks_through_the_execution_block() -> None:
+    raw = {"spend_ceiling": {"max_runtime_minutes": 20}}
+    assert "execution" not in RunRecord.from_row(_v2_row(execution_metadata_json=raw)).public()

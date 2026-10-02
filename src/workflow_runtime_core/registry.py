@@ -184,8 +184,28 @@ CORE_EVENT_KINDS = frozenset(
         "completed",
         "failed",
         "retention_started",
+        "lease_released",
     }
 )
+
+#: Kinds a caller may see, and nothing else about them. ``claimed`` carries the
+#: worker's owner and dispatch id in its detail, which is topology a caller must
+#: not learn, so the public timeline is ``{kind, created_at}`` only.
+PUBLIC_EVENT_KINDS = frozenset(
+    {
+        "created",
+        "claimed",
+        "paused",
+        "resume_requested",
+        "cancelled",
+        "lease_released",
+        "lease_expired",
+        "completed",
+        "failed",
+        "retention_started",
+    }
+)
+PUBLIC_EVENT_LIMIT = 50
 
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -848,6 +868,35 @@ def record_credential_sources(conn: DbConnection, run_id: str, sources: dict[str
         _require_execution_metadata_column(exc, "record_credential_sources")
 
 
+def record_spend_ceiling(conn: DbConnection, run_id: str, max_runtime_minutes: int) -> None:
+    """Declare the wall-clock ceiling THIS attempt runs under.
+
+    Written by the facade at start (and again at a retry) for an operator-started
+    billed run, and read by the runner as a deadline. Kept outside the pinned
+    snapshot on purpose: ``pinned`` is inherited verbatim by a retry, and a retry
+    must restate its own bound rather than inherit the parent's. Server-derived,
+    never reachable from caller ``config``.
+    """
+    if isinstance(max_runtime_minutes, bool) or max_runtime_minutes < 1:
+        raise RegistryError("max_runtime_minutes must be a positive integer")
+    entry = json.dumps({"max_runtime_minutes": max_runtime_minutes})
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET execution_metadata_json =
+                         coalesce(execution_metadata_json, '{}'::jsonb)
+                         || jsonb_build_object('spend_ceiling', %s::jsonb),
+                       updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (entry, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "record_spend_ceiling")
+
+
 #: Degradation kinds this module will store. An allowlist for the same reason
 #: the public projection is one: a caller inventing a kind is either a typo or a
 #: new class nobody has decided is client-safe, and both are better refused here
@@ -1050,9 +1099,16 @@ def release_lease(conn: DbConnection, run_id: str) -> None:
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = now() WHERE run_id = %s",
+                "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = now() "
+                "WHERE run_id = %s RETURNING status",
                 (run_id,),
             )
+            row = cur.fetchone()
+            if row is not None and row["status"] == RunStatus.CANCELLED.value:
+                # The worker standing down from a cancelled run is the one
+                # acknowledgement a caller can trust; ``cancelled`` alone is
+                # only the request.
+                _emit(conn, run_id, "lease_released")
     except psycopg.errors.UndefinedColumn as exc:
         _require_data_plane_column(exc, "release_lease")
 
@@ -1266,6 +1322,23 @@ def list_events(conn: DbConnection, run_id: str) -> list[dict[str, Any]]:
             (run_id,),
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def public_events(conn: DbConnection, run_id: str) -> list[dict[str, str]]:
+    """The caller-safe event timeline: allow-listed kinds, ``detail`` dropped.
+
+    Oldest-first over the last :data:`PUBLIC_EVENT_LIMIT` events.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, created_at FROM ("
+            "  SELECT kind, created_at, event_id FROM run_events"
+            "   WHERE run_id = %s AND kind = ANY(%s)"
+            "   ORDER BY created_at DESC, event_id DESC LIMIT %s"
+            ") recent ORDER BY created_at, event_id",
+            (run_id, sorted(PUBLIC_EVENT_KINDS), PUBLIC_EVENT_LIMIT),
+        )
+        return [{"kind": row["kind"], "created_at": row["created_at"].isoformat()} for row in cur.fetchall()]
 
 
 # --- retention ---------------------------------------------------------------
