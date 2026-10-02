@@ -214,7 +214,37 @@ class RunRecord:
         execution = public_execution_metadata(self.execution_metadata_json)
         if execution:
             payload["execution"] = execution
+        payload["cancellation"] = self.cancellation_state()
         return payload
+
+    def cancellation_state(self, now: datetime | None = None) -> str:
+        """Whether a cancellation is only asked for or the worker has stood down.
+
+        ``cancel_run`` flips the status and nothing else, so ``cancelled`` alone
+        cannot say whether work is still running (a prior run reported stopped
+        kept going for ten hours). The worker-owned lease is the witness: the
+        worker clears it on its way out, so a cleared lease is the
+        acknowledgement and a live one is a request still in flight. This reads
+        only columns the projection already holds and never emits them.
+
+        * ``not_requested`` — the run is not cancelled.
+        * ``confirmed`` — cancelled and no worker holds the lease (includes runs
+          cancelled while queued or paused, which truthfully had no worker).
+        * ``requested`` — cancelled, lease still held and unexpired.
+        * ``unavailable`` — cancelled but the registry cannot say: a lapsed
+          lease that was never released (the worker died), or a pre-v2 row with
+          no lease columns. Escalate; never read it as confirmed.
+        """
+        if self.status != RunStatus.CANCELLED:
+            return "not_requested"
+        if self.workspace_id is None:
+            return "unavailable"
+        if self.lease_owner is None:
+            return "confirmed"
+        expires = self.lease_expires_at
+        if expires is not None and expires > (now or utcnow()):
+            return "requested"
+        return "unavailable"
 
 
 #: Historical name used by the extracted Stromy runtime. Kept so consumer code
