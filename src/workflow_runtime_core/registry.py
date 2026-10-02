@@ -877,7 +877,7 @@ def record_spend_ceiling(conn: DbConnection, run_id: str, max_runtime_minutes: i
     must restate its own bound rather than inherit the parent's. Server-derived,
     never reachable from caller ``config``.
     """
-    if isinstance(max_runtime_minutes, bool) or not isinstance(max_runtime_minutes, int) or max_runtime_minutes < 1:
+    if isinstance(max_runtime_minutes, bool) or max_runtime_minutes < 1:
         raise RegistryError("max_runtime_minutes must be a positive integer")
     entry = json.dumps({"max_runtime_minutes": max_runtime_minutes})
     try:

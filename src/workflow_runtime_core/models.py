@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 
 class RunStatus(StrEnum):
@@ -227,8 +227,10 @@ class RunRecord:
         one reads ``None`` rather than the parent's bound.
         """
         raw = self.execution_metadata_json
-        ceiling = raw.get("spend_ceiling") if isinstance(raw, dict) else None
-        minutes = ceiling.get("max_runtime_minutes") if isinstance(ceiling, dict) else None
+        ceiling: Any = raw.get("spend_ceiling") if raw is not None else None
+        if not isinstance(ceiling, dict):
+            return None
+        minutes: Any = cast("dict[str, Any]", ceiling).get("max_runtime_minutes")
         return minutes if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0 else None
 
     def usage(self) -> dict[str, Any]:
