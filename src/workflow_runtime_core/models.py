@@ -215,7 +215,35 @@ class RunRecord:
         if execution:
             payload["execution"] = execution
         payload["cancellation"] = self.cancellation_state()
+        payload["usage"] = self.usage()
         return payload
+
+    def spend_ceiling_minutes(self) -> int | None:
+        """The wall-clock ceiling this attempt was started under, or ``None``.
+
+        Stored beside the pinned snapshot, never inside it: the pin is inherited
+        verbatim by a retry, and a ceiling must not be. Each attempt declares its
+        own (``registry.record_spend_ceiling``), so a retry that was not given
+        one reads ``None`` rather than the parent's bound.
+        """
+        raw = self.execution_metadata_json
+        ceiling = raw.get("spend_ceiling") if isinstance(raw, dict) else None
+        minutes = ceiling.get("max_runtime_minutes") if isinstance(ceiling, dict) else None
+        return minutes if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0 else None
+
+    def usage(self) -> dict[str, Any]:
+        """What is known about this run's usage — never a figure nobody measured.
+
+        ``reserved`` states the wall-clock ceiling the attempt was bounded by; it
+        is a time bound, not a currency guarantee. ``unavailable`` is the answer
+        for everything else, including every row that predates telemetry.
+        ``provider_reported`` is reserved vocabulary for a runner that emits
+        measured usage; nothing here ever produces a zero or a cost total.
+        """
+        minutes = self.spend_ceiling_minutes()
+        if minutes is not None:
+            return {"status": "reserved", "max_runtime_minutes": minutes}
+        return {"status": "unavailable"}
 
     def cancellation_state(self, now: datetime | None = None) -> str:
         """Whether a cancellation is only asked for or the worker has stood down.

@@ -513,3 +513,31 @@ def test_public_events_drop_unlisted_kinds_and_cap_the_window(blank_dsn: str) ->
         events = registry.public_events(conn, run.run_id)
         assert len(events) == registry.PUBLIC_EVENT_LIMIT
         assert "consumer_private" not in [e["kind"] for e in events]
+
+
+@pytest.mark.integration
+def test_a_retry_inherits_the_pin_but_never_the_spend_ceiling(blank_dsn: str) -> None:
+    """A retry must restate its own bound (ORG-PLAN-345)."""
+    _migrated(blank_dsn)
+    with registry.connect(blank_dsn) as conn:
+        run = registry.create_run(conn, workflow="demo", config={})
+        registry.pin_execution_metadata(conn, run.run_id, {"credential_policy": "operator"})
+        registry.record_spend_ceiling(conn, run.run_id, 15)
+        registry.claim_run(conn, run.run_id)
+        registry.mark_failed(conn, run.run_id, "boom")
+        parent = registry.get_run(conn, run.run_id)
+        assert parent is not None
+        assert parent.public()["usage"] == {"status": "reserved", "max_runtime_minutes": 15}
+
+        attempt = registry.create_retry(conn, run_id=run.run_id)
+        assert attempt.public()["usage"] == {"status": "unavailable"}
+        assert registry.read_execution_metadata(conn, attempt.run_id) == {"credential_policy": "operator"}
+
+        registry.record_spend_ceiling(conn, attempt.run_id, 30)
+        stored = registry.get_run(conn, attempt.run_id)
+        assert stored is not None
+        assert stored.public()["usage"]["max_runtime_minutes"] == 30
+        # The pin survives the ceiling write.
+        assert registry.read_execution_metadata(conn, attempt.run_id) == {"credential_policy": "operator"}
+        with pytest.raises(registry.RegistryError):
+            registry.record_spend_ceiling(conn, attempt.run_id, 0)

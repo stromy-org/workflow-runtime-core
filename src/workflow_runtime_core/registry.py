@@ -868,6 +868,35 @@ def record_credential_sources(conn: DbConnection, run_id: str, sources: dict[str
         _require_execution_metadata_column(exc, "record_credential_sources")
 
 
+def record_spend_ceiling(conn: DbConnection, run_id: str, max_runtime_minutes: int) -> None:
+    """Declare the wall-clock ceiling THIS attempt runs under.
+
+    Written by the facade at start (and again at a retry) for an operator-started
+    billed run, and read by the runner as a deadline. Kept outside the pinned
+    snapshot on purpose: ``pinned`` is inherited verbatim by a retry, and a retry
+    must restate its own bound rather than inherit the parent's. Server-derived,
+    never reachable from caller ``config``.
+    """
+    if isinstance(max_runtime_minutes, bool) or not isinstance(max_runtime_minutes, int) or max_runtime_minutes < 1:
+        raise RegistryError("max_runtime_minutes must be a positive integer")
+    entry = json.dumps({"max_runtime_minutes": max_runtime_minutes})
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE runs
+                   SET execution_metadata_json =
+                         coalesce(execution_metadata_json, '{}'::jsonb)
+                         || jsonb_build_object('spend_ceiling', %s::jsonb),
+                       updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (entry, run_id),
+            )
+    except psycopg.errors.UndefinedColumn as exc:
+        _require_execution_metadata_column(exc, "record_spend_ceiling")
+
+
 #: Degradation kinds this module will store. An allowlist for the same reason
 #: the public projection is one: a caller inventing a kind is either a typo or a
 #: new class nobody has decided is client-safe, and both are better refused here
