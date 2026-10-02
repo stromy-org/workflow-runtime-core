@@ -49,7 +49,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 from .. import registry, schema
-from ..exceptions import LeaseLost, SchemaVersionMismatch
+from ..exceptions import DeadlineExceeded, LeaseLost, SchemaVersionMismatch
 from ..models import TERMINAL_STATUSES, RunRecord, RunStatus, TerminalProjection
 from .checkpointer import DURABILITY, acheckpointer, bind_checkpointer
 from .progress import DEFAULT_PROGRESS_INTERVAL_SECONDS, ProgressRecorder
@@ -314,6 +314,58 @@ async def _with_lease_renewal(
             task.cancel()
 
 
+async def _with_deadline(
+    invocation: Awaitable[Any], seconds: float, *, run_id: str, minutes: float | None = None
+) -> Any:
+    """Drive ``invocation`` for at most ``seconds``; cancel AND await it on expiry.
+
+    The graph is cancelled and awaited before :class:`DeadlineExceeded`
+    propagates, for the reason :func:`_with_lease_renewal` gives: reporting first
+    and stopping later would leave this process still spending after the run was
+    recorded as over. Cancellation arriving from outside (a dropped lease) is
+    passed straight through to the graph.
+    """
+    task = asyncio.ensure_future(invocation)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+        if done:
+            return task.result()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        bound = f"{minutes:g} minute(s)" if minutes is not None else f"{seconds:g} second(s)"
+        raise DeadlineExceeded(f"run {run_id} exceeded its declared ceiling of {bound}")
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _deadline_seconds(
+    run: RunRecord, binding: ExecutionBinding, explicit: float | None
+) -> tuple[float | None, float | None]:
+    """The wall-clock bound for THIS execution, and the minutes it was declared in.
+
+    Precedence: an explicit argument, then the attempt's own declared spend
+    ceiling, then whatever default the binding supplies for workflows that carry
+    no ceiling (a no-provider fixture bounds itself). ``None`` means unbounded,
+    which is exactly how every run behaved before ceilings existed.
+
+    Probed with ``getattr`` for the reason :func:`_nodes_completed_so_far`
+    documents: a consumer may drive ``execute`` with its own run-shaped object.
+    """
+    if explicit is not None:
+        return explicit, None
+    ceiling = getattr(run, "spend_ceiling_minutes", None)
+    minutes = ceiling() if callable(ceiling) else None
+    if isinstance(minutes, int) and minutes > 0:
+        return minutes * 60.0, float(minutes)
+    default = getattr(binding, "default_deadline_seconds", None)
+    seconds = default(run) if callable(default) else None
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
+        return float(seconds), None
+    return None, None
+
+
 def _execution_scope(
     binding: ExecutionBinding, run: RunRecord
 ) -> AbstractAsyncContextManager[None]:
@@ -375,8 +427,15 @@ def execute(
     dsn: str | None = None,
     lease: LeaseRenewer | None = None,
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
+    deadline_seconds: float | None = None,
 ) -> int:
     """Execute an already-claimed run to a terminal or paused state.
+
+    Each execution is bounded by a wall-clock deadline when one applies (see
+    :func:`_deadline_seconds`): the graph is cancelled and awaited, the run is
+    recorded ``failed`` with ``error_type: deadline_exceeded``, and the lease is
+    released by that same write — never a stranded worker. A paused run's next
+    execution is a new one with its own bound.
 
     Pass ``lease`` when the run arrived over a transport that must stay leased
     for the duration (a queue message). Losing the lease returns
@@ -489,6 +548,11 @@ def execute(
                 return paused_at
 
             invocation = cast("Awaitable[Any]", _consume())
+            bound, bound_minutes = _deadline_seconds(run, binding, deadline_seconds)
+            if bound is not None:
+                invocation = _with_deadline(
+                    invocation, bound, run_id=run.run_id, minutes=bound_minutes
+                )
             try:
                 interrupt_payload: Any = (
                     await invocation

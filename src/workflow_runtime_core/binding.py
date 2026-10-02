@@ -163,6 +163,22 @@ class ScopedExecutionBinding(ExecutionBinding, Protocol):
 
 
 @runtime_checkable
+class DeadlineExecutionBinding(ExecutionBinding, Protocol):
+    """An :class:`ExecutionBinding` that bounds runs which declare no ceiling.
+
+    OPTIONAL, probed by attribute like :class:`ScopedExecutionBinding`. An
+    attempt that declares its own spend ceiling is bounded by it; this supplies
+    the default for the rest — a no-provider fixture that should never outlive a
+    few minutes whatever its caller asked. Return ``None`` for "unbounded", which
+    is what every run was before ceilings existed.
+    """
+
+    def default_deadline_seconds(self, run: RunRecord) -> float | None:
+        """Seconds this execution may run when the attempt declared no ceiling."""
+        ...
+
+
+@runtime_checkable
 class LeaseRenewer(Protocol):
     """Keeps a claimed run's single-writer lease alive during a long execution.
 
