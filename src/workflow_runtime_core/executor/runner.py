@@ -96,8 +96,11 @@ def run_once(
     binding: ExecutionBinding,
     *,
     dsn: str | None = None,
+    checkpoint_dsn: str | None = None,
 ) -> int:
     """Claim and execute one run. Returns a process exit code."""
+    if checkpoint_dsn is not None and not checkpoint_dsn.strip():
+        raise ValueError("explicit checkpoint_dsn must be nonempty")
     with registry.connect(dsn) as conn:
         # Refuse to run against a schema we do not understand, rather than
         # writing rows a future/past reader will misread. Read-only: the runner
@@ -123,7 +126,7 @@ def run_once(
     # Registry connection released before the (potentially hours-long) graph run:
     # job-per-run should hold exactly ONE connection — the checkpointer's — for
     # the duration, since concurrent connections are the shared-Postgres limit.
-    return execute(claimed, binding, dsn=dsn)
+    return execute(claimed, binding, dsn=dsn, checkpoint_dsn=checkpoint_dsn)
 
 
 class _StageError(Exception):
@@ -425,6 +428,7 @@ def execute(
     binding: ExecutionBinding,
     *,
     dsn: str | None = None,
+    checkpoint_dsn: str | None = None,
     lease: LeaseRenewer | None = None,
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     deadline_seconds: float | None = None,
@@ -447,6 +451,8 @@ def execute(
     for hours is indistinguishable from a wedged one, and a registry that cannot
     store it degrades on its own (see :mod:`.progress`).
     """
+    if checkpoint_dsn is not None and not checkpoint_dsn.strip():
+        raise ValueError("explicit checkpoint_dsn must be nonempty")
     config = dict(run.config_json)
     config.pop(registry.RESUME_KEY, None)
 
@@ -500,7 +506,8 @@ def execute(
         # provided" on the first async node, and a sync ``PostgresSaver`` has no
         # async methods for the async loop to call. The async path is a strict
         # superset — it also runs any sync-node graph.
-        async with acheckpointer(dsn) as saver:
+        # Deployment-owned binding only; graph/caller config cannot select a DB.
+        async with acheckpointer(dsn if checkpoint_dsn is None else checkpoint_dsn) as saver:
             compiled = bind_checkpointer(graph, saver)
             try:
                 context = await binding.build_context(run)

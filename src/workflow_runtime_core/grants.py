@@ -107,12 +107,13 @@ CORE_MANIFEST = GrantManifest(
         "run_launches",
         "event_outbox",
         "delivery_receipts",
+        "delivery_receipt_events",
     ),
     ledger_tables=(
         "schema_meta",
         "schema_migrations",
     ),
-    sequences=("run_events_event_id_seq",),
+    sequences=("run_events_event_id_seq", "delivery_receipt_events_event_id_seq"),
 )
 
 #: LangGraph's checkpoint store, as created by the saver's own ``setup()``.
