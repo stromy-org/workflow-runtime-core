@@ -399,11 +399,61 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_metadata_json JSONB;
 """
 
 
+_V5_DDL = """
+ALTER TABLE delivery_receipts DROP CONSTRAINT delivery_receipts_status_check;
+ALTER TABLE delivery_receipts ADD CONSTRAINT delivery_receipts_status_check
+    CHECK (status IN ('pending','sending','delivered','failed','uncertain','blocked','needs_review'));
+ALTER TABLE delivery_receipts ADD COLUMN provider_ref_recorded_at TIMESTAMPTZ;
+ALTER TABLE delivery_receipts ADD COLUMN effect_started_at TIMESTAMPTZ;
+ALTER TABLE delivery_receipts ADD COLUMN claim_epoch BIGINT NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0);
+ALTER TABLE delivery_receipts ADD COLUMN event_version BIGINT NOT NULL DEFAULT 0 CHECK (event_version >= 0);
+UPDATE delivery_receipts SET provider_ref_recorded_at = updated_at WHERE provider_ref IS NOT NULL;
+-- Existing sending/uncertain rows might already have effected the provider.
+UPDATE delivery_receipts SET effect_started_at = updated_at
+    WHERE status IN ('sending','delivered','uncertain') OR provider_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS delivery_receipt_events (
+    event_id BIGSERIAL PRIMARY KEY,
+    service_namespace TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    event_version BIGINT NOT NULL,
+    transition TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('service','human')),
+    actor TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 256),
+    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 2000),
+    evidence JSONB NOT NULL DEFAULT '{}' CHECK (octet_length(evidence::text) <= 4096),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (service_namespace,destination,message_id)
+        REFERENCES delivery_receipts(service_namespace,destination,message_id),
+    UNIQUE (service_namespace,destination,message_id,event_version)
+);
+-- Audit rows are immutable even if a broad legacy app role has DML grants.
+CREATE FUNCTION wrc_deny_receipt_event_mutation() RETURNS trigger
+    LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+    RAISE EXCEPTION 'delivery receipt events are append-only' USING ERRCODE = '42501';
+END;
+$$;
+CREATE TRIGGER delivery_receipt_events_immutable
+    BEFORE UPDATE OR DELETE OR TRUNCATE ON delivery_receipt_events
+    FOR EACH STATEMENT EXECUTE FUNCTION wrc_deny_receipt_event_mutation();
+INSERT INTO delivery_receipt_events (
+    service_namespace,destination,message_id,event_version,transition,to_status,actor_kind,actor,reason
+) SELECT service_namespace,destination,message_id,0,'migration_backfill',status,
+    'service','wrc-migrator','Existing receipt imported; prior transition evidence unavailable'
+    FROM delivery_receipts;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="run_registry_v1", sql=_V1_DDL),
     Migration(version=2, name="workflow_data_plane_v2", sql=_V2_DDL),
     Migration(version=3, name="durable_messaging_v3", sql=_V3_DDL),
     Migration(version=4, name="execution_metadata_v4", sql=_V4_DDL),
+    Migration(version=5, name="fenced_effect_ledger_v5", sql=_V5_DDL),
 )
 
 #: Highest version this build knows how to apply.

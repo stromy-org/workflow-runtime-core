@@ -45,9 +45,7 @@ def _envelope(message_id: str = "wamid.1", **overrides: object) -> Envelope:
 
 def _submit(dsn: str, envelope: Envelope) -> inbox.SubmitResult:
     with registry.connect(dsn) as conn:
-        return inbox.submit_event(
-            conn, envelope, launcher="subprocess", params_hash="h0"
-        )
+        return inbox.submit_event(conn, envelope, launcher="subprocess", params_hash="h0")
 
 
 # --- 1. ingress atomicity + de-duplication ------------------------------------
@@ -124,9 +122,7 @@ def test_an_oversized_envelope_is_refused_before_any_row_exists(blank_dsn: str) 
 @pytest.mark.integration
 def test_too_many_attachment_descriptors_are_refused(blank_dsn: str) -> None:
     _migrated(blank_dsn)
-    attachment = AttachmentRef(
-        media_type="image/jpeg", size_bytes=10, digest="a" * 64, reference="s3://x"
-    )
+    attachment = AttachmentRef(media_type="image/jpeg", size_bytes=10, digest="a" * 64, reference="s3://x")
     with pytest.raises(EnvelopeTooLarge):
         _submit(blank_dsn, _envelope(attachments=tuple([attachment] * 21)))
 
@@ -160,9 +156,7 @@ def test_a_launched_run_records_its_execution_reference(blank_dsn: str) -> None:
     with registry.connect(blank_dsn) as conn:
         claimed = launches.claim_due(conn, owner="disp-a", lease_seconds=60)
         assert [r.run_id for r in claimed] == [result.run_id]
-        assert launches.record_launched(
-            conn, result.run_id, owner="disp-a", execution_ref="pid:4242"
-        )
+        assert launches.record_launched(conn, result.run_id, owner="disp-a", execution_ref="pid:4242")
         launch = launches.get_launch(conn, result.run_id)
 
     assert launch is not None
@@ -188,12 +182,8 @@ def test_a_dispatcher_that_lost_its_lease_cannot_overwrite_the_new_owner(
         launches.claim_due(conn, owner="disp-b", lease_seconds=60)
 
         # disp-a is a zombie now.
-        assert not launches.record_launched(
-            conn, result.run_id, owner="disp-a", execution_ref="pid:stale"
-        )
-        assert launches.record_launched(
-            conn, result.run_id, owner="disp-b", execution_ref="pid:live"
-        )
+        assert not launches.record_launched(conn, result.run_id, owner="disp-a", execution_ref="pid:stale")
+        assert launches.record_launched(conn, result.run_id, owner="disp-b", execution_ref="pid:live")
         launch = launches.get_launch(conn, result.run_id)
 
     assert launch is not None and launch.execution_ref == "pid:live"
@@ -206,9 +196,7 @@ def test_a_failed_launch_backs_off_instead_of_spinning(blank_dsn: str) -> None:
 
     with registry.connect(blank_dsn) as conn:
         launches.claim_due(conn, owner="disp-a", lease_seconds=60)
-        assert launches.record_failed(
-            conn, result.run_id, owner="disp-a", error="ECS throttled", attempts=6
-        )
+        assert launches.record_failed(conn, result.run_id, owner="disp-a", error="ECS throttled", attempts=6)
         launch = launches.get_launch(conn, result.run_id)
         # Backed off into the future, so an immediate re-poll finds nothing.
         assert launches.claim_due(conn, owner="disp-a", lease_seconds=60) == []
@@ -227,9 +215,7 @@ def test_a_live_execution_is_adopted_rather_than_relaunched(blank_dsn: str) -> N
 
     with registry.connect(blank_dsn) as conn:
         launches.claim_due(conn, owner="disp-a", lease_seconds=0)
-        assert launches.adopt_live_execution(
-            conn, result.run_id, execution_ref="pid:survivor"
-        )
+        assert launches.adopt_live_execution(conn, result.run_id, execution_ref="pid:survivor")
         launch = launches.get_launch(conn, result.run_id)
         assert launches.reconcile_stale(conn) == []
 
@@ -278,9 +264,7 @@ def test_delivery_requires_holding_the_lease(blank_dsn: str) -> None:
                 run_id=result.run_id,
             ),
         )
-        claimed = outbox.claim_due(
-            conn, service_namespace=NS, owner="egress-a", lease_seconds=60
-        )
+        claimed = outbox.claim_due(conn, service_namespace=NS, owner="egress-a", lease_seconds=60)
         assert [r.outbox_id for r in claimed] == [outbox_id]
 
         # A replica that does not hold the lease cannot mark it delivered.
@@ -297,13 +281,9 @@ def test_an_unroutable_publish_leaves_the_message_retryable(blank_dsn: str) -> N
     with registry.connect(blank_dsn) as conn:
         outbox_id = outbox.enqueue(
             conn,
-            OutboxMessage(
-                service_namespace=NS, message_id="m-x", destination="typo.queue"
-            ),
+            OutboxMessage(service_namespace=NS, message_id="m-x", destination="typo.queue"),
         )
-        claimed = outbox.claim_due(
-            conn, service_namespace=NS, owner="egress-a", lease_seconds=60
-        )
+        claimed = outbox.claim_due(conn, service_namespace=NS, owner="egress-a", lease_seconds=60)
         assert outbox.mark_failed(
             conn,
             outbox_id,
@@ -329,18 +309,12 @@ def test_a_crashed_publisher_releases_its_message(blank_dsn: str) -> None:
     with registry.connect(blank_dsn) as conn:
         outbox_id = outbox.enqueue(
             conn,
-            OutboxMessage(
-                service_namespace=NS, message_id="m-c", destination="whatsapp.reply"
-            ),
+            OutboxMessage(service_namespace=NS, message_id="m-c", destination="whatsapp.reply"),
         )
-        outbox.claim_due(
-            conn, service_namespace=NS, owner="egress-dead", lease_seconds=0
-        )
+        outbox.claim_due(conn, service_namespace=NS, owner="egress-dead", lease_seconds=0)
         assert outbox.reconcile_stale(conn) == [outbox_id]
         # Immediately re-claimable by a live replica, same message id.
-        again = outbox.claim_due(
-            conn, service_namespace=NS, owner="egress-live", lease_seconds=60
-        )
+        again = outbox.claim_due(conn, service_namespace=NS, owner="egress-live", lease_seconds=60)
 
     assert [r.outbox_id for r in again] == [outbox_id]
     assert again[0].message_id == "m-c"
@@ -350,9 +324,7 @@ def test_a_crashed_publisher_releases_its_message(blank_dsn: str) -> None:
 
 
 def _open_and_claim(conn: registry.DbConnection, message_id: str, owner: str):
-    receipts.open_receipt(
-        conn, service_namespace=NS, destination="whatsapp", message_id=message_id
-    )
+    receipts.open_receipt(conn, service_namespace=NS, destination="whatsapp", message_id=message_id)
     return receipts.claim_due(
         conn,
         service_namespace=NS,
@@ -373,8 +345,10 @@ def test_a_definitive_rejection_is_retried(blank_dsn: str) -> None:
             destination="whatsapp",
             message_id="r-1",
             owner="sender-a",
+            claim_epoch=1,
             error="422 invalid template",
             attempts=claimed[0].attempts,
+            evidence={"outcome": "definitive_no_effect", "adapter_code": "422"},
         )
         assert receipts.list_uncertain(conn, service_namespace=NS) == []
 
@@ -395,6 +369,7 @@ def test_an_ambiguous_outcome_becomes_uncertain_and_is_never_auto_retried(
             destination="whatsapp",
             message_id="r-2",
             owner="sender-a",
+            claim_epoch=1,
             reason="read timeout after request write",
         )
         # Not picked up by the ordinary loop, at any point.
@@ -418,9 +393,7 @@ def test_a_crash_mid_send_becomes_uncertain_not_pending(blank_dsn: str) -> None:
     """Reconciliation must NOT return a half-sent message to the retry queue."""
     _migrated(blank_dsn)
     with registry.connect(blank_dsn) as conn:
-        receipts.open_receipt(
-            conn, service_namespace=NS, destination="whatsapp", message_id="r-3"
-        )
+        receipts.open_receipt(conn, service_namespace=NS, destination="whatsapp", message_id="r-3")
         receipts.claim_due(
             conn,
             service_namespace=NS,
@@ -428,7 +401,7 @@ def test_a_crash_mid_send_becomes_uncertain_not_pending(blank_dsn: str) -> None:
             owner="sender-dead",
             lease_seconds=0,
         )
-        assert receipts.reconcile_stale(conn) == ["r-3"]
+        assert receipts.reconcile_stale(conn, service_namespace=NS) == ["r-3"]
         worklist = receipts.list_uncertain(conn, service_namespace=NS)
 
     assert [r.message_id for r in worklist] == ["r-3"]
@@ -445,15 +418,18 @@ def test_an_uncertain_receipt_is_resolved_explicitly(blank_dsn: str) -> None:
             destination="whatsapp",
             message_id="r-4",
             owner="sender-a",
+            claim_epoch=1,
             reason="timeout",
         )
-        assert receipts.resolve_uncertain(
+        assert receipts.resolve(
             conn,
             service_namespace=NS,
             destination="whatsapp",
             message_id="r-4",
-            delivered=True,
-            provider_ref="SM123",
+            disposition="delivered",
+            actor=receipts.ReceiptActor("human", "reviewer"),
+            expected_status="uncertain",
+            expected_version=3,
             note="confirmed present in provider log",
         )
         assert receipts.list_uncertain(conn, service_namespace=NS) == []
@@ -472,13 +448,9 @@ def test_the_purge_dry_run_matches_what_the_purge_deletes(blank_dsn: str) -> Non
         registry.claim_run(conn, result.run_id)
         registry.mark_completed(conn, result.run_id, {"ok": True})
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE event_inbox SET received_at = now() - interval '400 days'"
-            )
+            cur.execute("UPDATE event_inbox SET received_at = now() - interval '400 days'")
 
-        previewed = inbox.purge_inbox(
-            conn, service_namespace=NS, older_than_days=30, dry_run=True
-        )
+        previewed = inbox.purge_inbox(conn, service_namespace=NS, older_than_days=30, dry_run=True)
         deleted = inbox.purge_inbox(conn, service_namespace=NS, older_than_days=30)
 
     assert previewed == 1
@@ -493,17 +465,11 @@ def test_retention_never_deletes_an_undelivered_message(blank_dsn: str) -> None:
     with registry.connect(blank_dsn) as conn:
         outbox.enqueue(
             conn,
-            OutboxMessage(
-                service_namespace=NS, message_id="m-owed", destination="whatsapp.reply"
-            ),
+            OutboxMessage(service_namespace=NS, message_id="m-owed", destination="whatsapp.reply"),
         )
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE event_outbox SET created_at = now() - interval '400 days'"
-            )
-        assert (
-            outbox.purge_delivered(conn, service_namespace=NS, older_than_days=30) == 0
-        )
+            cur.execute("UPDATE event_outbox SET created_at = now() - interval '400 days'")
+        assert outbox.purge_delivered(conn, service_namespace=NS, older_than_days=30) == 0
         assert outbox.pending_depth(conn, service_namespace=NS) == 1
 
 
@@ -517,9 +483,7 @@ def test_purge_keeps_a_paused_runs_envelope(blank_dsn: str) -> None:
         registry.claim_run(conn, result.run_id)
         registry.mark_paused(conn, result.run_id, {"question": "which order?"})
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE event_inbox SET received_at = now() - interval '400 days'"
-            )
+            cur.execute("UPDATE event_inbox SET received_at = now() - interval '400 days'")
         assert inbox.purge_inbox(conn, service_namespace=NS, older_than_days=30) == 0
         assert inbox.get_envelope(conn, result.run_id) is not None
 
@@ -533,9 +497,7 @@ def test_purge_keeps_a_paused_runs_envelope(blank_dsn: str) -> None:
 
 
 def _opened(conn: registry.DbConnection, message_id: str) -> None:
-    receipts.open_receipt(
-        conn, service_namespace=NS, destination="whatsapp", message_id=message_id
-    )
+    receipts.open_receipt(conn, service_namespace=NS, destination="whatsapp", message_id=message_id)
 
 
 def _claim(conn: registry.DbConnection, message_id: str, owner: str, lease: int = 60):
@@ -563,9 +525,7 @@ def test_the_identity_claim_takes_the_row_it_was_given(blank_dsn: str) -> None:
         assert claimed.message_id == "mine"
         assert claimed.attempts == 1
 
-        other = receipts.get_receipt(
-            conn, service_namespace=NS, destination="whatsapp", message_id="other"
-        )
+        other = receipts.get_receipt(conn, service_namespace=NS, destination="whatsapp", message_id="other")
         assert other is not None
         assert other.status == "pending"
         assert other.lease_owner is None
@@ -580,21 +540,32 @@ def test_a_redelivered_message_is_not_sent_twice(blank_dsn: str) -> None:
     with registry.connect(blank_dsn) as conn:
         _opened(conn, "r-dup")
         assert _claim(conn, "r-dup", "consumer-a") is not None
+        assert receipts.start_effect(
+            conn, service_namespace=NS, destination="whatsapp", message_id="r-dup", owner="consumer-a", claim_epoch=1
+        )
+        assert receipts.record_provider_ref(
+            conn,
+            service_namespace=NS,
+            destination="whatsapp",
+            message_id="r-dup",
+            owner="consumer-a",
+            claim_epoch=1,
+            provider_ref="SM123",
+        )
         assert receipts.mark_delivered(
             conn,
             service_namespace=NS,
             destination="whatsapp",
             message_id="r-dup",
             owner="consumer-a",
+            claim_epoch=1,
             provider_ref="SM123",
         )
 
         # The broker redelivers. The consumer asks again and is refused.
         assert _claim(conn, "r-dup", "consumer-b") is None
 
-        settled = receipts.get_receipt(
-            conn, service_namespace=NS, destination="whatsapp", message_id="r-dup"
-        )
+        settled = receipts.get_receipt(conn, service_namespace=NS, destination="whatsapp", message_id="r-dup")
         assert settled is not None
         assert settled.status == "delivered"
         assert settled.provider_ref == "SM123"
@@ -619,6 +590,7 @@ def test_an_uncertain_receipt_is_never_reclaimed_by_a_redelivery(
             destination="whatsapp",
             message_id="r-unc",
             owner="consumer-a",
+            claim_epoch=1,
             reason="timeout after send",
         )
         assert _claim(conn, "r-unc", "consumer-b") is None
@@ -634,25 +606,24 @@ def test_a_live_lease_blocks_a_concurrent_consumer(blank_dsn: str) -> None:
 
 
 @pytest.mark.integration
-def test_a_lapsed_lease_is_reclaimed_without_waiting_for_reconciliation(
+def test_a_lapsed_push_lease_becomes_uncertain_without_resending(
     blank_dsn: str,
 ) -> None:
-    """A consumer died mid-send and the broker redelivered. The replacement must
-    be able to take the row now; making it wait for a reconciliation pass would
-    stall the lane for no reason."""
+    """A consumer died mid-effect. Redelivery must audit uncertainty and stop,
+    rather than reissuing a non-idempotent provider call."""
     _migrated(blank_dsn)
     with registry.connect(blank_dsn) as conn:
         _opened(conn, "r-lapsed")
         assert _claim(conn, "r-lapsed", "dead-consumer", lease=60) is not None
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE delivery_receipts SET lease_expires_at = now() - interval '1s'"
-            )
+            cur.execute("UPDATE delivery_receipts SET lease_expires_at = now() - interval '1s'")
 
         reclaimed = _claim(conn, "r-lapsed", "live-consumer")
-        assert reclaimed is not None
-        assert reclaimed.lease_owner == "live-consumer"
-        assert reclaimed.attempts == 2
+        assert reclaimed is None
+        current = receipts.get_receipt(conn, service_namespace=NS, destination="whatsapp", message_id="r-lapsed")
+        assert current is not None
+        assert current.status == "uncertain"
+        assert current.attempts == 1
 
         # And the dead consumer, waking up, cannot settle what it no longer owns.
         assert not receipts.mark_delivered(
@@ -661,6 +632,7 @@ def test_a_lapsed_lease_is_reclaimed_without_waiting_for_reconciliation(
             destination="whatsapp",
             message_id="r-lapsed",
             owner="dead-consumer",
+            claim_epoch=1,
         )
 
 
@@ -682,8 +654,10 @@ def test_a_failed_send_is_reclaimable_immediately_on_the_push_path(
             destination="whatsapp",
             message_id="r-retry",
             owner="consumer-a",
+            claim_epoch=1,
             error="421 try again later",
             attempts=claimed.attempts,
+            evidence={"outcome": "definitive_no_effect", "adapter_code": "421"},
         )
         # next_attempt_at is now in the future; the pull path would skip it.
         assert (

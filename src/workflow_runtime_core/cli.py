@@ -194,9 +194,7 @@ def status(dsn: str | None, as_json: bool) -> None:
                 ledger = f"MISMATCH — {exc}"
                 ledger_ok = False
 
-    compatible = ledger_ok and live is not None and (
-        schema.SUPPORTED_SCHEMA_MIN <= live <= schema.SUPPORTED_SCHEMA_MAX
-    )
+    compatible = ledger_ok and live is not None and (schema.SUPPORTED_SCHEMA_MIN <= live <= schema.SUPPORTED_SCHEMA_MAX)
     if as_json:
         click.echo(
             _json.dumps(
@@ -218,16 +216,10 @@ def status(dsn: str | None, as_json: bool) -> None:
     else:
         click.echo(f"live schema:      {'unmigrated' if live is None else f'v{live}'}")
         click.echo(f"checkpoint store: {checkpoint}")
-        click.echo(
-            f"supported range:  [v{schema.SUPPORTED_SCHEMA_MIN}, "
-            f"v{schema.SUPPORTED_SCHEMA_MAX}]"
-        )
+        click.echo(f"supported range:  [v{schema.SUPPORTED_SCHEMA_MIN}, v{schema.SUPPORTED_SCHEMA_MAX}]")
         click.echo(f"compatible:       {'yes' if compatible else 'NO'}")
         click.echo(f"ledger:           {ledger}")
-        click.echo(
-            "pending:          "
-            + (", ".join(f"v{m.version} {m.name}" for m in todo) if todo else "none")
-        )
+        click.echo("pending:          " + (", ".join(f"v{m.version} {m.name}" for m in todo) if todo else "none"))
     if not compatible:
         raise SystemExit(1)
 
@@ -393,7 +385,8 @@ _namespace_option = click.option(
 
 @main.command()
 @_dsn_option
-def reconcile(dsn: str | None) -> None:
+@_namespace_option
+def reconcile(dsn: str | None, namespace: str) -> None:
     """Recover work stranded by a crashed dispatcher, publisher or sender.
 
     Each of the three has a different correct recovery, which is why this is one
@@ -410,7 +403,7 @@ def reconcile(dsn: str | None) -> None:
     with registry.connect(dsn) as conn:
         relaunched = launches.reconcile_stale(conn)
         republished = outbox.reconcile_stale(conn)
-        unresolved = receipts.reconcile_stale(conn)
+        unresolved = receipts.reconcile_stale(conn, service_namespace=namespace)
 
     click.echo(f"launches returned to pending:   {len(relaunched)}")
     click.echo(f"outbox rows returned to retry:  {len(republished)}")
@@ -423,10 +416,107 @@ def reconcile(dsn: str | None) -> None:
         )
 
 
+@main.group()
+def deliveries() -> None:
+    """Inspect and resolve external effects without repeating provider writes."""
+
+
+@deliveries.command("list")
+@_dsn_option
+@_namespace_option
+@click.option(
+    "--status",
+    "receipt_status",
+    type=click.Choice(
+        [
+            "pending",
+            "sending",
+            "delivered",
+            "failed",
+            "uncertain",
+            "blocked",
+            "needs_review",
+        ]
+    ),
+)
+@click.option("--limit", type=click.IntRange(1, 1000), default=100)
+def deliveries_list(dsn: str | None, namespace: str, receipt_status: str | None, limit: int) -> None:
+    """List a bounded, namespace-scoped worklist."""
+    from .messaging import receipts
+
+    with registry.connect(dsn) as conn:
+        rows = receipts.list_deliveries(conn, service_namespace=namespace, status=receipt_status, limit=limit)
+    for row in rows:
+        click.echo(f"{row.destination} {row.message_id} {row.status} version={row.event_version}")
+
+
+@deliveries.command("show")
+@_dsn_option
+@_namespace_option
+@click.option("--destination", required=True)
+@click.argument("message_id")
+def deliveries_show(dsn: str | None, namespace: str, destination: str, message_id: str) -> None:
+    """Show one receipt's state and audit version."""
+    from .messaging import receipts
+
+    with registry.connect(dsn) as conn:
+        row = receipts.get_receipt(conn, service_namespace=namespace, destination=destination, message_id=message_id)
+    if row is None:
+        raise click.ClickException("receipt not found")
+    click.echo(
+        f"{row.status} version={row.event_version} epoch={row.claim_epoch} provider_ref={row.provider_ref or '-'}"
+    )
+
+
+@deliveries.command("resolve")
+@_dsn_option
+@_namespace_option
+@click.option("--destination", required=True)
+@click.option("--disposition", type=click.Choice(["delivered", "blocked", "retry_new_generation"]), required=True)
+@click.option("--actor", required=True)
+@click.option("--actor-kind", type=click.Choice(["service", "human"]), required=True)
+@click.option("--expected-status", type=click.Choice(["uncertain", "needs_review"]), required=True)
+@click.option("--expected-version", type=click.IntRange(0), required=True)
+@click.option("--note", required=True)
+@click.argument("message_id")
+def deliveries_resolve(
+    dsn: str | None,
+    namespace: str,
+    destination: str,
+    disposition: str,
+    actor: str,
+    actor_kind: str,
+    expected_status: str,
+    expected_version: int,
+    note: str,
+    message_id: str,
+) -> None:
+    """Audit a resolution with an explicit principal and optimistic version."""
+    from .messaging import receipts
+
+    if disposition == "retry_new_generation":
+        raise click.ClickException("use the domain resolution service for atomic new-generation lineage")
+    with registry.connect(dsn) as conn:
+        changed = receipts.resolve(
+            conn,
+            service_namespace=namespace,
+            destination=destination,
+            message_id=message_id,
+            disposition=disposition,
+            actor=receipts.ReceiptActor(actor_kind, actor),
+            note=note,
+            expected_status=expected_status,
+            expected_version=expected_version,
+        )
+    if not changed:
+        raise click.ClickException("receipt absent or expected state/version is stale")
+    click.echo("resolution recorded")
+
+
 @main.command()
 @_dsn_option
 @_namespace_option
-@click.option("--limit", type=int, default=100, show_default=True)
+@click.option("--limit", type=click.IntRange(1, 1000), default=100, show_default=True)
 def uncertain(dsn: str | None, namespace: str, limit: int) -> None:
     """List deliveries whose provider outcome could not be observed.
 

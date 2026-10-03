@@ -46,10 +46,10 @@ def _run_on(dsn: str, *, target: int | None = None) -> str:
 
 
 @pytest.mark.integration
-def test_v4_is_the_latest_this_build_applies(blank_dsn: str) -> None:
-    assert LATEST_VERSION == 4
+def test_latest_schema_preserves_the_v4_metadata_contract(blank_dsn: str) -> None:
+    assert LATEST_VERSION >= 4
     with registry.connect(blank_dsn) as conn:
-        assert apply_migrations(conn) == 4
+        assert apply_migrations(conn) == LATEST_VERSION
 
 
 @pytest.mark.integration
