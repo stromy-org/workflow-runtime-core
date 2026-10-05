@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.17.0
+
+- `receipts.claim_due(message_ids=...)` optionally restricts the pull to at most
+  1,000 distinct message IDs prevalidated by a domain adapter. Namespace,
+  destination, due time, status, owner/epoch and SKIP LOCKED behavior still apply.
+  An empty selection claims nothing; omitting it preserves existing behavior.
+- `receipts.review_uncertain(...)` records an audited, event-version-fenced service
+  transition from `uncertain` to `needs_review`, including effects whose create
+  response lost the provider ID. It never creates, retries or marks delivered.
+- Both seams use the existing schema-v5 ledger; no migration or domain payload.
+
+## 0.16.0
+
+Client stamps and fenced external effects (ORG-PLAN-347/C2): committed effect
+markers and provider references, live owner/claim-epoch fences, append-only audit
+events, definitive-rejection-only retry, exact-object read-only reconciliation,
+and an explicit checkpoint DSN separate from the run registry binding.
+
 ## 0.15.0
 
 ORG-PLAN-345 — a run is bounded by the wall-clock ceiling its attempt was started under.
