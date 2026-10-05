@@ -38,6 +38,32 @@ empty tuple selects nothing; leaving it unset preserves the generic pull.
 redacted inspection evidence. It moves an unknown effect to review even when a
 create response lost its provider ID; it cannot retry or mark delivered.
 
+Restricted receipt roles can use `ReceiptCapabilityConnection(native)` from
+`workflow_runtime_core.messaging.receipt_capabilities`. It borrows the native
+connection and preserves the caller's transaction: a proposal, its binding and
+the WRC receipt can commit or roll back together. Existing receipt APIs keep
+their arguments; the wrapper uses individually granted, fixed SQL functions.
+It never falls back to raw table mutations or creates another receipt ledger.
+
+The migration owner explicitly runs `wrc receipt-capabilities-setup --owner-role
+<owner>`. This opt-in checksum-ledger chain adds functions only and leaves core
+schema v5 unchanged. Every function fixes its search path and revokes PUBLIC
+execution; setup grants nothing to application roles. Deployment manifests must
+name each permitted function using `function_name(operation)` and revoke raw
+receipt/audit table writes. The application also needs SELECT on core schema
+metadata and receipt rows. A runtime principal cannot run setup, even when the
+capability ledger is already current.
+
+Grant `open` only to an authorized domain definer that atomically persists a
+proposal. Grant worker and read-only recovery operations only to the connector.
+Keep `resolve:*` behind the domain resolution service, which authenticates the
+reviewer before calling WRC: a SQL argument is evidence of an actor, not an
+authentication mechanism. No application role needs access to every capability.
+Unknown operations, ungranted functions, wrong transition/status/actor kinds,
+stale leases and optimistic versions all fail closed. Frozen migration bytes
+are checked against the same fixed query definitions used by native callers;
+changing an installed capability requires a new numbered migration.
+
 ```bash
 uv run pytest tests/unit
 uv run pytest tests/contract
