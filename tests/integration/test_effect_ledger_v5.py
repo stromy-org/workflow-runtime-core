@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import psycopg
@@ -278,16 +279,13 @@ def test_expired_push_negative_control_detects_the_restored_unsafe_predicate(
         # Restore the exact pre-C2 expired-sending retry condition in the real
         # mutation seam. The same regression assertion must fail under it.
         conn.execute("UPDATE delivery_receipts SET status='sending',lease_expires_at=now()-interval '1 second'")
-        change = r._change
+        from workflow_runtime_core.messaging._receipt_sql import OPERATIONS
 
-        def unsafe_change(conn: registry.DbConnection, **kwargs: Any) -> r.DeliveryReceipt | None:
-            if kwargs["transition"] == "claim":
-                kwargs["predicate"] = (
-                    "p.status IN ('pending','failed') OR (p.status='sending' AND p.lease_expires_at<now())"
-                )
-            return change(conn, **kwargs)
-
+        unsafe = replace(
+            OPERATIONS["claim"],
+            predicate=("p.status IN ('pending','failed') OR (p.status='sending' AND p.lease_expires_at<now())"),
+        )
         monkeypatch.setattr(r, "_expire", lambda *args, **kwargs: False)
-        monkeypatch.setattr(r, "_change", unsafe_change)
+        monkeypatch.setitem(OPERATIONS, "claim", unsafe)
         with pytest.raises(AssertionError):
             assert_no_resend(conn)

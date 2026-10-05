@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.0
+
+- Add opt-in, individually granted receipt SQL capabilities for applications
+  denied raw receipt/audit table writes. Native callers and core schema v5
+  remain compatible. Both paths use the same WRC-owned fixed SQL operations.
+- Add explicit `wrc receipt-capabilities-setup`, with owner privilege proof,
+  checksum-ledger installation, fixed definer search paths and PUBLIC execution
+  revoked. Setup applies no application grants.
+- Validate raw capability calls against pinned transition/status/actor kind,
+  lease fences, bounded selection and redacted evidence; a capability cannot
+  impersonate another operation. Borrowed connections retain caller-owned
+  transaction boundaries for atomic domain-plus-receipt commits.
+
 ## 0.17.0
 
 - `receipts.claim_due(message_ids=...)` optionally restricts the pull to at most

@@ -376,6 +376,27 @@ def list_migrations() -> None:
         click.echo(f"v{m.version}  {m.name}  sha256={m.checksum}")
 
 
+@main.command("receipt-capabilities-setup")
+@_dsn_option
+@_owner_role_option
+def receipt_capabilities_setup(dsn: str | None, owner_role: str | None) -> None:
+    """Install opt-in fixed receipt functions; PUBLIC receives no execution grants.
+
+    Role-specific grants are deployment-owned and name each function explicitly.
+    Existing native-DML consumers and the core schema version are unchanged.
+    """
+    from .auth import resolve_owner_role
+    from .messaging.receipt_capabilities import CAPABILITY_NAMESPACE, migrations
+    from .migrations import apply_app_migrations, assert_may_migrate
+
+    with registry.connect(dsn) as conn:
+        owner = resolve_owner_role(owner_role)
+        assert_may_migrate(conn, owner_role=owner)
+        schema.require_compatible_schema(conn, minimum=5)
+        reached = apply_app_migrations(conn, CAPABILITY_NAMESPACE, migrations(), owner_role=owner)
+    click.echo(f"receipt capabilities set up (v{reached}); no role grants applied")
+
+
 _namespace_option = click.option(
     "--namespace",
     required=True,

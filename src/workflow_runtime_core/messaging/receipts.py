@@ -16,6 +16,8 @@ from typing import Any, Literal, LiteralString, cast
 from ..registry import DbConnection
 from ..schema import require_compatible_schema
 from ._backoff import next_delay_seconds
+from ._receipt_sql import CLAIM_DUE_QUERY, OPEN_QUERY, OPERATIONS, STALE_QUERY
+from .receipt_capabilities import ReceiptCapabilityConnection, execute_capability
 
 RECEIPT_STATUSES = ("pending", "sending", "delivered", "failed", "uncertain", "blocked", "needs_review")
 _EVIDENCE_KEYS = frozenset({"evidence_ref", "expected_digest", "observed_digest", "outcome", "adapter_code"})
@@ -74,14 +76,12 @@ def _audit(actor: object, reason: str, evidence: dict[str, str] | None) -> str:
 
 
 def _change(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
     message_id: str,
-    assignments: str,
     values: tuple[Any, ...],
-    predicate: str,
     fences: tuple[Any, ...],
     transition: str,
     actor: ReceiptActor,
@@ -90,52 +90,30 @@ def _change(
 ) -> DeliveryReceipt | None:
     """Internal SQL fragments are fixed literals; all adapter values are parameters."""
     encoded = _audit(actor, reason, evidence)
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
-        cur.execute(
-            cast(
-                LiteralString,
-                f"""
-            WITH prior AS MATERIALIZED (
-                SELECT * FROM delivery_receipts
-                 WHERE service_namespace=%s AND destination=%s AND message_id=%s
-                 FOR UPDATE
-            ), changed AS (
-                UPDATE delivery_receipts r SET {assignments},
-                    event_version=r.event_version+1, updated_at=now()
-                FROM prior p
-                WHERE r.service_namespace=p.service_namespace AND r.destination=p.destination
-                    AND r.message_id=p.message_id AND ({predicate})
-                RETURNING r.*, p.status AS prior_status
-            ), audit AS (
-                INSERT INTO delivery_receipt_events (
-                    service_namespace,destination,message_id,event_version,transition,
-                    from_status,to_status,actor_kind,actor,reason,evidence
-                ) SELECT service_namespace,destination,message_id,event_version,%s,
-                    prior_status,status,%s,%s,%s,%s::jsonb FROM changed
-                RETURNING event_id
-            ) SELECT changed.* FROM changed CROSS JOIN audit
-            """,  # noqa: S608 - fragments are internal fixed SQL, never caller input
-            ),
-            (
-                service_namespace,
-                destination,
-                message_id,
-                *values,
-                *fences,
-                transition,
-                actor.kind,
-                actor.subject,
-                reason,
-                encoded,
-            ),
+        parameters = (
+            service_namespace,
+            destination,
+            message_id,
+            *values,
+            *fences,
+            transition,
+            actor.kind,
+            actor.subject,
+            reason,
+            encoded,
         )
+        if isinstance(conn, ReceiptCapabilityConnection):
+            execute_capability(cur, transition, parameters)
+        else:
+            cur.execute(cast(LiteralString, OPERATIONS[transition].query()), parameters)
         row = cur.fetchone()
     return None if row is None else DeliveryReceipt.from_row(row)
 
 
 def open_receipt(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -143,32 +121,23 @@ def open_receipt(
     actor: ReceiptActor = _OPEN_ACTOR,
 ) -> None:
     encoded = _audit(actor, "Receipt opened", None)
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            WITH opened AS (
-                INSERT INTO delivery_receipts(service_namespace,destination,message_id,status,event_version)
-                VALUES (%s,%s,%s,'pending',1)
-                ON CONFLICT (service_namespace,destination,message_id) DO NOTHING RETURNING *
-            ) INSERT INTO delivery_receipt_events (
-                service_namespace,destination,message_id,event_version,transition,to_status,
-                actor_kind,actor,reason,evidence
-            ) SELECT service_namespace,destination,message_id,event_version,'open',status,
-                %s,%s,'Receipt opened',%s::jsonb FROM opened
-            """,
-            (service_namespace, destination, message_id, actor.kind, actor.subject, encoded),
-        )
+        parameters = (service_namespace, destination, message_id, actor.kind, actor.subject, encoded)
+        if isinstance(conn, ReceiptCapabilityConnection):
+            execute_capability(cur, "open", parameters)
+        else:
+            cur.execute(OPEN_QUERY, parameters)
 
 
 def get_receipt(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
     message_id: str,
 ) -> DeliveryReceipt | None:
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT * FROM delivery_receipts WHERE service_namespace=%s AND destination=%s AND message_id=%s",
@@ -178,16 +147,16 @@ def get_receipt(
     return None if row is None else DeliveryReceipt.from_row(row)
 
 
-def _expire(conn: DbConnection, *, service_namespace: str, destination: str, message_id: str) -> bool:
+def _expire(
+    conn: DbConnection | ReceiptCapabilityConnection, *, service_namespace: str, destination: str, message_id: str
+) -> bool:
     return (
         _change(
             conn,
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments="status='uncertain', lease_owner=NULL, lease_expires_at=NULL, last_error=%s",
             values=("Sender lease expired; provider outcome unobservable",),
-            predicate="p.status='sending' AND p.lease_expires_at<=now()",
             fences=(),
             transition="lease_expired",
             actor=ReceiptActor("service", "receipt-reconciler"),
@@ -198,7 +167,7 @@ def _expire(conn: DbConnection, *, service_namespace: str, destination: str, mes
 
 
 def claim(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -214,10 +183,7 @@ def claim(
         service_namespace=service_namespace,
         destination=destination,
         message_id=message_id,
-        assignments="status='sending', attempts=r.attempts+1, claim_epoch=r.claim_epoch+1, "
-        "lease_owner=%s, lease_expires_at=now()+make_interval(secs=>%s)",
         values=(owner, lease_seconds),
-        predicate="p.status IN ('pending','failed') AND p.provider_ref IS NULL",
         fences=(),
         transition="claim",
         actor=ReceiptActor("service", owner),
@@ -245,7 +211,7 @@ def _message_selection(value: object) -> list[str] | None:
 
 
 def claim_due(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -256,17 +222,13 @@ def claim_due(
 ) -> list[DeliveryReceipt]:
     _limit(limit)
     selection = _message_selection(message_ids)
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
-        cur.execute(
-            """SELECT message_id FROM delivery_receipts
-            WHERE service_namespace=%s AND destination=%s AND status IN ('pending','failed')
-                AND next_attempt_at<=now()
-                AND (%s::text[] IS NULL OR message_id=ANY(%s::text[]))
-                ORDER BY next_attempt_at,message_id LIMIT %s
-            FOR UPDATE SKIP LOCKED""",
-            (service_namespace, destination, selection, selection, limit),
-        )
+        parameters = (service_namespace, destination, selection, selection, limit)
+        if isinstance(conn, ReceiptCapabilityConnection):
+            execute_capability(cur, "select_due", parameters)
+        else:
+            cur.execute(CLAIM_DUE_QUERY, parameters)
         ids = [str(row["message_id"]) for row in cur.fetchall()]
     claimed = [
         claim(
@@ -282,22 +244,17 @@ def claim_due(
     return [row for row in claimed if row is not None]
 
 
-_LIVE = "p.status='sending' AND p.lease_owner=%s AND p.claim_epoch=%s AND p.lease_expires_at>now()"
-
-
 def _worker(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
     message_id: str,
     owner: str,
     claim_epoch: int,
-    assignments: str,
     values: tuple[Any, ...],
     transition: str,
     reason: str,
-    extra: str = "TRUE",
     extra_values: tuple[Any, ...] = (),
     evidence: dict[str, str] | None = None,
 ) -> bool:
@@ -307,9 +264,7 @@ def _worker(
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments=assignments,
             values=values,
-            predicate=f"{_LIVE} AND ({extra})",
             fences=(owner, claim_epoch, *extra_values),
             transition=transition,
             actor=ReceiptActor("service", owner),
@@ -321,7 +276,7 @@ def _worker(
 
 
 def renew_lease(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -339,7 +294,6 @@ def renew_lease(
         message_id=message_id,
         owner=owner,
         claim_epoch=claim_epoch,
-        assignments="lease_expires_at=now()+make_interval(secs=>%s)",
         values=(lease_seconds,),
         transition="renew_lease",
         reason="Worker renewed lease",
@@ -347,7 +301,7 @@ def renew_lease(
 
 
 def start_effect(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -363,16 +317,14 @@ def start_effect(
         message_id=message_id,
         owner=owner,
         claim_epoch=claim_epoch,
-        assignments="effect_started_at=now()",
         values=(),
-        extra="p.effect_started_at IS NULL AND p.provider_ref IS NULL",
         transition="start_effect",
         reason="Provider effect authorized to start",
     )
 
 
 def record_provider_ref(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -390,9 +342,7 @@ def record_provider_ref(
         message_id=message_id,
         owner=owner,
         claim_epoch=claim_epoch,
-        assignments="provider_ref=%s, provider_ref_recorded_at=COALESCE(r.provider_ref_recorded_at,now())",
         values=(provider_ref,),
-        extra="p.effect_started_at IS NOT NULL AND (p.provider_ref IS NULL OR p.provider_ref=%s)",
         extra_values=(provider_ref,),
         transition="record_provider_ref",
         reason="Provider reference persisted",
@@ -400,7 +350,7 @@ def record_provider_ref(
 
 
 def _settle(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -410,7 +360,6 @@ def _settle(
     status: str,
     reason: str,
     provider_ref: str | None = None,
-    extra: str = "TRUE",
     extra_values: tuple[Any, ...] = (),
     evidence: dict[str, str] | None = None,
     delay: float = 0,
@@ -422,14 +371,7 @@ def _settle(
         message_id=message_id,
         owner=owner,
         claim_epoch=claim_epoch,
-        assignments="status=%s, provider_ref=COALESCE(r.provider_ref,%s), "
-        "provider_ref_recorded_at=CASE WHEN COALESCE(r.provider_ref,%s) IS NOT NULL "
-        "THEN COALESCE(r.provider_ref_recorded_at,now()) ELSE NULL END, "
-        "lease_owner=NULL, lease_expires_at=NULL, last_error=%s, "
-        "next_attempt_at=now()+make_interval(secs=>%s), "
-        "effect_started_at=CASE WHEN %s='failed' THEN NULL ELSE r.effect_started_at END",
         values=(status, provider_ref, provider_ref, None if status == "delivered" else reason, delay, status),
-        extra=f"({extra}) AND (p.provider_ref IS NULL OR %s::text IS NULL OR p.provider_ref=%s)",
         extra_values=(*extra_values, provider_ref, provider_ref),
         transition=status,
         reason=reason,
@@ -438,7 +380,7 @@ def _settle(
 
 
 def mark_delivered(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -457,13 +399,12 @@ def mark_delivered(
         status="delivered",
         reason="Provider confirmed effect",
         provider_ref=provider_ref,
-        extra="p.effect_started_at IS NOT NULL AND (p.provider_ref IS NOT NULL OR %s::text IS NULL)",
         extra_values=(provider_ref,),
     )
 
 
 def mark_failed(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -485,14 +426,13 @@ def mark_failed(
         claim_epoch=claim_epoch,
         status="failed",
         reason=error,
-        extra="p.provider_ref IS NULL",
         evidence=evidence,
         delay=next_delay_seconds(attempts),
     )
 
 
 def mark_uncertain(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -516,7 +456,7 @@ def mark_uncertain(
 
 
 def mark_needs_review(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -540,7 +480,7 @@ def mark_needs_review(
 
 
 def block(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -554,9 +494,7 @@ def block(
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments="status='blocked',last_error=%s",
             values=(reason,),
-            predicate="p.status IN ('pending','failed')",
             fences=(),
             transition="block",
             actor=actor,
@@ -567,7 +505,7 @@ def block(
 
 
 def block_unstarted(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -585,12 +523,11 @@ def block_unstarted(
         claim_epoch=claim_epoch,
         status="blocked",
         reason=reason,
-        extra="p.effect_started_at IS NULL AND p.provider_ref IS NULL",
     )
 
 
 def defer_unstarted(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -612,20 +549,20 @@ def defer_unstarted(
         status="pending",
         reason=reason,
         delay=delay_seconds,
-        extra="p.effect_started_at IS NULL AND p.provider_ref IS NULL",
     )
 
 
-def reconcile_stale(conn: DbConnection, *, service_namespace: str, limit: int = 100) -> list[str]:
+def reconcile_stale(
+    conn: DbConnection | ReceiptCapabilityConnection, *, service_namespace: str, limit: int = 100
+) -> list[str]:
     _limit(limit)
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
-        cur.execute(
-            """SELECT destination,message_id FROM delivery_receipts
-            WHERE service_namespace=%s AND status='sending' AND lease_expires_at<=now()
-            ORDER BY lease_expires_at,message_id LIMIT %s FOR UPDATE SKIP LOCKED""",
-            (service_namespace, limit),
-        )
+        parameters = (service_namespace, limit)
+        if isinstance(conn, ReceiptCapabilityConnection):
+            execute_capability(cur, "select_stale", parameters)
+        else:
+            cur.execute(STALE_QUERY, parameters)
         rows = cur.fetchall()
     return [
         str(row["message_id"])
@@ -645,7 +582,7 @@ def _limit(limit: int) -> None:
 
 
 def list_deliveries(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     status: str | None = None,
@@ -655,7 +592,7 @@ def list_deliveries(
     _limit(limit)
     if status is not None and status not in RECEIPT_STATUSES:
         raise ValueError("unknown receipt status")
-    require_compatible_schema(conn, minimum=5)
+    require_compatible_schema(conn.native if isinstance(conn, ReceiptCapabilityConnection) else conn, minimum=5)
     with conn.cursor() as cur:
         cur.execute(
             """SELECT * FROM delivery_receipts WHERE service_namespace=%s
@@ -675,12 +612,14 @@ def list_deliveries(
         return [DeliveryReceipt.from_row(row) for row in cur.fetchall()]
 
 
-def list_uncertain(conn: DbConnection, *, service_namespace: str, limit: int = 100) -> list[DeliveryReceipt]:
+def list_uncertain(
+    conn: DbConnection | ReceiptCapabilityConnection, *, service_namespace: str, limit: int = 100
+) -> list[DeliveryReceipt]:
     return list_deliveries(conn, service_namespace=service_namespace, status="uncertain", limit=limit)
 
 
 def resolve(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -707,9 +646,7 @@ def resolve(
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments="status=%s,last_error=%s,lease_owner=NULL,lease_expires_at=NULL",
             values=("delivered" if disposition == "delivered" else "blocked", note),
-            predicate="p.status=%s AND p.event_version=%s",
             fences=(expected_status, expected_version),
             transition=f"resolve:{disposition}",
             actor=actor,
@@ -721,7 +658,7 @@ def resolve(
 
 
 def review_uncertain(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -745,9 +682,7 @@ def review_uncertain(
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments="status='needs_review',last_error=%s,lease_owner=NULL,lease_expires_at=NULL",
             values=(reason,),
-            predicate="p.status='uncertain' AND p.event_version=%s",
             fences=(expected_version,),
             transition="review_uncertain",
             actor=actor,
@@ -759,7 +694,7 @@ def review_uncertain(
 
 
 def reconcile_known_ref(
-    conn: DbConnection,
+    conn: DbConnection | ReceiptCapabilityConnection,
     *,
     service_namespace: str,
     destination: str,
@@ -781,9 +716,7 @@ def reconcile_known_ref(
             service_namespace=service_namespace,
             destination=destination,
             message_id=message_id,
-            assignments="status=%s,last_error=%s,lease_owner=NULL,lease_expires_at=NULL",
             values=("delivered" if matches else "needs_review", None if matches else "Final object digest mismatch"),
-            predicate="p.status='uncertain' AND p.event_version=%s AND p.provider_ref=%s",
             fences=(expected_version, provider_ref),
             transition="reconcile_known_ref",
             actor=actor,
