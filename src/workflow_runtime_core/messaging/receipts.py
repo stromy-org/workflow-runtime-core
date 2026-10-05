@@ -225,6 +225,25 @@ def claim(
     )
 
 
+def _message_selection(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    error = "message_ids requires at most 1000 distinct bounded identifiers"
+    if not isinstance(value, tuple):
+        raise ValueError(error)
+    identifiers = cast(tuple[object, ...], value)
+    if len(identifiers) > 1000:
+        raise ValueError(error)
+    selected: list[str] = []
+    for identifier in identifiers:
+        if not isinstance(identifier, str) or not identifier.strip() or len(identifier.encode()) > 2048:
+            raise ValueError(error)
+        selected.append(identifier)
+    if len(set(selected)) != len(selected):
+        raise ValueError(error)
+    return selected
+
+
 def claim_due(
     conn: DbConnection,
     *,
@@ -233,16 +252,20 @@ def claim_due(
     owner: str,
     lease_seconds: int,
     limit: int = 20,
+    message_ids: tuple[str, ...] | None = None,
 ) -> list[DeliveryReceipt]:
     _limit(limit)
+    selection = _message_selection(message_ids)
     require_compatible_schema(conn, minimum=5)
     with conn.cursor() as cur:
         cur.execute(
             """SELECT message_id FROM delivery_receipts
             WHERE service_namespace=%s AND destination=%s AND status IN ('pending','failed')
-                AND next_attempt_at<=now() ORDER BY next_attempt_at,message_id LIMIT %s
+                AND next_attempt_at<=now()
+                AND (%s::text[] IS NULL OR message_id=ANY(%s::text[]))
+                ORDER BY next_attempt_at,message_id LIMIT %s
             FOR UPDATE SKIP LOCKED""",
-            (service_namespace, destination, limit),
+            (service_namespace, destination, selection, selection, limit),
         )
         ids = [str(row["message_id"]) for row in cur.fetchall()]
     claimed = [
@@ -691,6 +714,44 @@ def resolve(
             transition=f"resolve:{disposition}",
             actor=actor,
             reason=note,
+            evidence=evidence,
+        )
+        is not None
+    )
+
+
+def review_uncertain(
+    conn: DbConnection,
+    *,
+    service_namespace: str,
+    destination: str,
+    message_id: str,
+    expected_version: int,
+    actor: ReceiptActor,
+    reason: str,
+    evidence: dict[str, str],
+) -> bool:
+    """An unknown effect needs review; this grants neither retry nor completion.
+
+    Works without a provider reference, including a lost create response. The
+    adapter supplies a verified service actor and redacted inspection evidence.
+    A newer event or any other status loses the CAS without changing the row.
+    """
+    if actor.kind != "service" or expected_version < 1 or not evidence.get("evidence_ref"):
+        raise ValueError("unknown-effect review requires a service and inspection evidence")
+    return (
+        _change(
+            conn,
+            service_namespace=service_namespace,
+            destination=destination,
+            message_id=message_id,
+            assignments="status='needs_review',last_error=%s,lease_owner=NULL,lease_expires_at=NULL",
+            values=(reason,),
+            predicate="p.status='uncertain' AND p.event_version=%s",
+            fences=(expected_version,),
+            transition="review_uncertain",
+            actor=actor,
+            reason=reason,
             evidence=evidence,
         )
         is not None

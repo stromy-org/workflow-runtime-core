@@ -26,6 +26,18 @@ from workflow_runtime_core import ...   # populate __all__ in src/workflow_runti
 
 ## Tests
 
+Receipt adapters import `workflow_runtime_core.messaging.receipts`. Commit the
+claim and `start_effect` marker before provider I/O, then commit the provider ID
+before finalization. Every worker transition requires the live lease owner and
+claim epoch. Unknown outcomes are never automatically recreated.
+
+`claim_due(message_ids=(...))` restricts selection to a bounded set of domain
+IDs while retaining the namespace/destination, due-time and status fences. An
+empty tuple selects nothing; leaving it unset preserves the generic pull.
+`review_uncertain` requires a verified service actor, current event version and
+redacted inspection evidence. It moves an unknown effect to review even when a
+create response lost its provider ID; it cannot retry or mark delivered.
+
 ```bash
 uv run pytest tests/unit
 uv run pytest tests/contract
