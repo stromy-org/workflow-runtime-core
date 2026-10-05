@@ -87,9 +87,7 @@ class AttachmentRef:
         if self.size_bytes < 0:
             raise EnvelopeError(f"attachment size_bytes must be >= 0, got {self.size_bytes}")
         if not _SHA256_RE.match(self.digest):
-            raise EnvelopeError(
-                f"attachment digest must be a lowercase hex sha256, got {self.digest!r}"
-            )
+            raise EnvelopeError(f"attachment digest must be a lowercase hex sha256, got {self.digest!r}")
         if not self.reference.strip():
             raise EnvelopeError("attachment reference must not be empty")
 

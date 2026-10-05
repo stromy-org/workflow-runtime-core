@@ -161,9 +161,7 @@ def claim_due(
         return [LaunchRecord.from_row(row) for row in cur.fetchall()]
 
 
-def record_launched(
-    conn: DbConnection, run_id: str, *, owner: str, execution_ref: str
-) -> bool:
+def record_launched(conn: DbConnection, run_id: str, *, owner: str, execution_ref: str) -> bool:
     """Record a successful launch and release the lease.
 
     Guarded on ``lease_owner``: a dispatcher whose lease already expired and was
@@ -265,9 +263,7 @@ def reconcile_stale(conn: DbConnection, *, limit: int = 100) -> list[str]:
         return [str(row["run_id"]) for row in cur.fetchall()]
 
 
-def adopt_live_execution(
-    conn: DbConnection, run_id: str, *, execution_ref: str
-) -> bool:
+def adopt_live_execution(conn: DbConnection, run_id: str, *, execution_ref: str) -> bool:
     """Mark a stale-but-alive launch as launched instead of relaunching it.
 
     The counterpart to :func:`reconcile_stale` for the case where the launcher

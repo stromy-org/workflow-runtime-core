@@ -57,9 +57,7 @@ def _existing(conn: DbConnection, envelope: Envelope) -> SubmitResult | None:
         row = cur.fetchone()
     if row is None:
         return None
-    return SubmitResult(
-        run_id=str(row["run_id"]), inbox_id=str(row["inbox_id"]), duplicate=True
-    )
+    return SubmitResult(run_id=str(row["run_id"]), inbox_id=str(row["inbox_id"]), duplicate=True)
 
 
 def submit_event(

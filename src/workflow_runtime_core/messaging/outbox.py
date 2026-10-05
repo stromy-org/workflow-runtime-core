@@ -132,9 +132,7 @@ def enqueue(conn: DbConnection, message: OutboxMessage) -> str:
         )
         existing = cur.fetchone()
     if existing is None:  # pragma: no cover - would mean the row vanished mid-statement
-        raise RuntimeError(
-            f"outbox message {message.message_id!r} neither inserted nor found"
-        )
+        raise RuntimeError(f"outbox message {message.message_id!r} neither inserted nor found")
     return str(existing["outbox_id"])
 
 
@@ -207,9 +205,7 @@ def mark_delivered(conn: DbConnection, outbox_id: str, *, owner: str) -> bool:
         return cur.fetchone() is not None
 
 
-def mark_failed(
-    conn: DbConnection, outbox_id: str, *, owner: str, error: str, attempts: int
-) -> bool:
+def mark_failed(conn: DbConnection, outbox_id: str, *, owner: str, error: str, attempts: int) -> bool:
     """Return a message to the retry schedule after a failed publish."""
     delay = next_delay_seconds(attempts)
     with conn.cursor() as cur:
@@ -278,9 +274,7 @@ def pending_depth(conn: DbConnection, *, service_namespace: str) -> int:
     return 0 if row is None else int(row["n"])
 
 
-def oldest_pending_age_seconds(
-    conn: DbConnection, *, service_namespace: str
-) -> float | None:
+def oldest_pending_age_seconds(conn: DbConnection, *, service_namespace: str) -> float | None:
     """Age of the oldest undelivered message, or ``None`` when the outbox is clear.
 
     The metric that actually catches a stuck egress. Depth alone does not: a
