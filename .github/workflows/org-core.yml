@@ -17,6 +17,10 @@ on:
       - '.agents/org-core.md'
       - 'scripts/check-org-core.py'
       - 'scripts/render-agent-md.py'
+      - 'scripts/instruction_routes.py'
+      - '.claude/instruction-routes.json'
+      - '.claude/rules/**'
+      - '.claude/hooks/context-router.sh'
       - '.github/workflows/org-core.yml'
   push:
     branches: [main]
@@ -35,3 +39,6 @@ jobs:
         run: python3 scripts/check-org-core.py --check
       - name: Generated agent files match AGENTS.md
         run: python3 scripts/render-agent-md.py --check
+      - name: Routed rules are reachable (portable route kit, ORG-PLAN-331 C11)
+        if: hashFiles('scripts/instruction_routes.py') != ''
+        run: python3 scripts/instruction_routes.py --check
