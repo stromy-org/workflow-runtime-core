@@ -28,90 +28,23 @@ on:
     branches: [main]
 
 jobs:
-  quality:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-      - run: uv python install 3.12
-      - run: uv sync --all-extras
-      - name: Lint
-        run: uv run ruff check
-      - name: Type check
-        run: uv run pyright src/workflow_runtime_core/
 
-  test:
-    runs-on: ubuntu-latest
+  python-ci:
+    # ci-dedup (inside the reusable workflow) reads the merged PR behind a push
+    # and that PR's workflow runs. The org default token grants contents+packages
+    # only, so without these the action 403s on every push and silently never
+    # skips — the checks then run twice per change, which is the cost it exists to
+    # remove. A called workflow inherits this job's grant and can only downgrade
+    # it, so it has to be declared here rather than in ci-python.yml.
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: read
+      actions: read
+    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
+    with:
+      source_package: "src/workflow_runtime_core"
+    # Forward the org stromy-ci App secrets (CI_APP_ID / CI_APP_PRIVATE_KEY)
+    # so the reusable workflow can clone private deps. No-op if absent.
+    secrets: inherit
 
-    # Real engines as SERVICE containers rather than leaving every integration
-    # test to spin its own testcontainer. Two reasons, and the second matters
-    # more than the speed:
-    #
-    # 1. One engine for the whole job instead of one per fixture scope.
-    # 2. The broker fixtures fall back to `pytest.importorskip` when their env
-    #    var is unset, and a skip is indistinguishable from a pass in the run
-    #    summary. Pinning the URLs here means that fallback is never reached in
-    #    CI, so the delivery guarantees are always genuinely exercised. NOT-RUN
-    #    is not a pass — the same reasoning as the contract job's refusal to
-    #    tolerate exit 5.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: wrc
-          POSTGRES_PASSWORD: wrc
-          POSTGRES_DB: wrc
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U wrc"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-      rabbitmq:
-        image: rabbitmq:4-management
-        ports:
-          - 5672:5672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q check_running"
-          --health-interval 10s
-          --health-timeout 10s
-          --health-retries 20
-
-    env:
-      STROMY_PG_DSN: postgresql://wrc:wrc@127.0.0.1:5432/wrc
-      STROMY_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
-
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-      - run: uv python install 3.12
-      - run: uv sync --all-extras
-
-      - name: Unit tests
-        run: uv run pytest tests/unit -v
-
-      - name: Contract tests
-        # The optional-extra boundary (a base install pulls neither LangGraph nor
-        # aio-pika) is asserted here. That is the package's headline guarantee to
-        # the public facade, so a vacuous pass would be worse than useless —
-        # unlike the shared workflow, this does NOT tolerate exit 5.
-        run: uv run pytest -m contract -v
-
-      - name: Integration tests (real PostgreSQL + RabbitMQ)
-        # Not optional. The one bug this package has actually shipped was a probe
-        # that aborted its caller's transaction on a FRESH database — invisible to
-        # every mock, reproducible only against a real engine, and fatal on the
-        # first boot of every new deployment. The broker guarantees are the same
-        # shape: "an unroutable mandatory publish raises" and "an unacknowledged
-        # delivery is redelivered" are claims about RabbitMQ, and a fake only
-        # proves the fake matches our belief.
-        #
-        # `-ra` surfaces skip reasons in the summary; with the service URLs set
-        # above there should be none, so any skip line here is a signal that a
-        # fixture quietly stopped reaching its engine.
-        run: uv run pytest tests/integration -v -ra
