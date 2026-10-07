@@ -1,0 +1,10 @@
+{
+  "about": "ORG-PLAN-331 C5 deliberate relocations for workflow-runtime-core.",
+  "entries": [
+    {
+      "match": "Never hand-edit CLAUDE.md or .github/copilot-instructions.md",
+      "owner": "AGENTS.md",
+      "why": "owned by the org-core block in AGENTS.md ('Generated files are never hand-edited'); the repo-local restatement and its Agent-md rendering section were dropped"
+    }
+  ]
+}

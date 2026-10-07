@@ -1,0 +1,32 @@
+# Instruction preservation proof — workflow-runtime-core (ORG-PLAN-331 C5)
+
+Method: stromy-org .claude/skills/instruction-audit/scripts/instruction_preservation.py
+(ORG-PLAN-324 C7), run against this repo with BEFORE = the pre-dedupe head. Every
+bold span of 3+ words and every MUST/never/always sentence from the old AGENTS.md
+and .claude/rules/*.md must map to exactly one post-change directive owner
+(AGENTS.md or one routed rule): `missing` and `duplicate_owners` must be 0.
+Deliberate rewordings, relocations and corrections are listed with their reason
+from docs/instruction-preservation-ORG-PLAN-331.map.json.
+
+Delivery matrix (how each owner reaches a session):
+- always-on: AGENTS.md keeps dependency direction and the four security-critical
+  invariants (no DDL from app code, secret fields withheld, roles as arguments,
+  object-named grants) as one-liners
+- procedures: runtime-invariants.md (all ten invariants verbatim, module map, public
+  API, dev patterns, test layout; src/**, tests/**) and database-auth.md (auth
+  modules, plus any WRC_PG_* setting written into a file), routed by the portable
+  kit this change installs
+
+before: HEAD
+items: 33
+preserved: 32
+mapped: 1
+missing: 0
+duplicate_owners: 0
+
+## missing
+
+## duplicate_owners
+
+## mapped (deliberate rewording or relocation)
+AGENTS.md: '**Never hand-edit** `CLAUDE.md` or `.github/copilot-instructions.md` — they carry a "GENER' -> AGENTS.md (owned by the org-core block in AGENTS.md ('Generated files are never hand-edited'); the repo-local restatement and its Agent-md rendering section were dropped)
