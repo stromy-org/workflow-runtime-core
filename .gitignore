@@ -29,6 +29,9 @@ venv/
 
 # Test / coverage
 .pytest_cache/
+.unit-junit.xml
+.contract-junit.xml
+.release-junit.xml
 .coverage
 .coverage.*
 htmlcov/

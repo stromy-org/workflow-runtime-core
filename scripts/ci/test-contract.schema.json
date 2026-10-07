@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Opt-in executable test ownership contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "suites"],
+  "properties": {
+    "version": {"const": 1},
+    "not_applicable_reason": {"type": "string", "minLength": 1},
+    "suites": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/suite"}
+    }
+  },
+  "$defs": {
+    "paths": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"}
+    },
+    "suite": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "owner", "tier", "surface", "paths", "source_inputs", "required", "minimum_executed"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*$"},
+        "owner": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "tier": {"enum": ["deterministic", "integration", "live"]},
+        "surface": {"enum": ["pr", "scheduled", "local"]},
+        "paths": {"$ref": "#/$defs/paths"},
+        "source_inputs": {"$ref": "#/$defs/paths"},
+        "required": {"type": "boolean"},
+        "minimum_executed": {"type": "integer", "minimum": 0},
+        "execution_step": {"enum": ["tests", "contract", "browser", "node"]},
+        "exclusion_reason": {"type": "string", "minLength": 1},
+        "receiver": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {"if": {"properties": {"required": {"const": true}}},
+         "then": {"properties": {"minimum_executed": {"minimum": 1}}}},
+        {"if": {"properties": {"required": {"const": false}}},
+         "then": {"required": ["exclusion_reason"]}},
+        {"if": {"properties": {"surface": {"enum": ["scheduled", "local"]}}},
+         "then": {"required": ["receiver"]}},
+        {"if": {"properties": {"tier": {"const": "live"}}},
+         "then": {"properties": {"surface": {"enum": ["scheduled", "local"]}}, "required": ["receiver"]}}
+      ]
+    }
+  }
+}
