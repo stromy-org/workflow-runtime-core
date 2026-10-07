@@ -37,7 +37,8 @@ from pathlib import Path
 CI_INPUTS: tuple[str, ...] = ("AGENTS.md", ".agents/org-core.md")
 
 REFERENCE_REL = ".agents/org-core.md"
-START_RE = re.compile(r"^<!-- org-core:start v(?P<version>[1-9][0-9]*) (?P<note>[^\n]*)-->\n", re.MULTILINE)
+START_RE = re.compile(
+    r"^<!-- org-core:start v(?P<version>[1-9][0-9]*) (?P<note>[^\n]*)-->\n", re.MULTILINE)
 END_MARK = "<!-- org-core:end -->\n"
 #: Codex cloud cuts project docs at its 32 KiB default (`project_doc_max_bytes`).
 CLOUD_CODEX_BYTES = 32_768
@@ -91,25 +92,30 @@ def check(repo: Path) -> list[str]:
         return [f"org-core-reference-invalid: {REFERENCE_REL}: {exc}"]
 
     if ref_block != ref_text:
-        findings.append(f"org-core-reference-invalid: {REFERENCE_REL} holds text outside the block")
+        findings.append(
+            f"org-core-reference-invalid: {REFERENCE_REL} holds text outside the block")
     if version != ref_version:
-        findings.append(f"org-core-stale: AGENTS.md block is v{version}, {REFERENCE_REL} is v{ref_version}")
+        findings.append(f"org-core-stale: AGENTS.md block is v{version}, "
+                        f"{REFERENCE_REL} is v{ref_version}")
     elif block != ref_block:
         findings.append(f"org-core-tampered: AGENTS.md block differs from {REFERENCE_REL} "
-                        "(edit the canonical source in global-skills and re-render; never this copy)")
+                        "(edit the canonical source in global-skills and re-render; "
+                        "never this copy)")
     return findings
 
 
 def size_warnings(repo: Path) -> list[str]:
     agents = repo / "AGENTS.md"
     if agents.is_file() and (n := agents.stat().st_size) > CLOUD_CODEX_BYTES:
-        return [(f"codex-cloud-truncation: AGENTS.md is {n:,} bytes, over the {CLOUD_CODEX_BYTES:,}-byte "
-                 "Codex cloud default; the tail never reaches a cloud session")]
+        return [(f"codex-cloud-truncation: AGENTS.md is {n:,} bytes, over the "
+                 f"{CLOUD_CODEX_BYTES:,}-byte Codex cloud default; the tail never reaches "
+                 "a cloud session")]
     return []
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo", type=Path, default=Path.cwd())
     p.add_argument("--check", action="store_true", required=True,
                    help="exit 1 unless the AGENTS.md block equals the inert reference")

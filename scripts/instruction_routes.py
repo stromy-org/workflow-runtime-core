@@ -395,6 +395,14 @@ def stamp_index(routes: list[dict], *, write: bool) -> str | None:
     return "AGENTS.md: route index is stale (run --stamp)"
 
 
+def _regex_error(rx: str) -> str | None:
+    try:
+        re.compile(rx)
+    except re.error as exc:
+        return str(exc)
+    return None
+
+
 def check() -> int:
     routes = load()
     problems: list[str] = []
@@ -403,8 +411,9 @@ def check() -> int:
         scoped = [p.name for p in sorted(RULES.glob("*.md")) if frontmatter_paths(p.read_text())]
         if scoped:
             for name in scoped:
-                print(f"instruction-routing: FAIL {name}: path-scoped but no instruction-routes.json "
-                      "route names it, so the Bash/Grep path will never load it")
+                print(f"instruction-routing: FAIL {name}: path-scoped but no "
+                      "instruction-routes.json route names it, so the Bash/Grep path "
+                      "will never load it")
             return 1
         for p in sorted(RULES.glob("*.md")):
             print(f"instruction-routing: warning {p.name}: unscoped, loads into every session")
@@ -417,11 +426,9 @@ def check() -> int:
         if name in seen:
             problems.append(f"{name}: declared twice in the table")
         seen.add(name)
-        for rx in [*r.get("commands", []), *r.get("content", [])]:
-            try:
-                re.compile(rx)
-            except re.error as exc:
-                problems.append(f"{name}: selector {rx!r} is not a valid regex ({exc})")
+        problems.extend(f"{name}: selector {rx!r} is not a valid regex ({err})"
+                        for rx in [*r.get("commands", []), *r.get("content", [])]
+                        if (err := _regex_error(rx)))
 
         p = rule_path(r)
         if not p.exists():
