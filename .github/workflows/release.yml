@@ -63,6 +63,8 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    # Ref and version checks — seconds of work (stromy-org ORG-PLAN-343).
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.read.outputs.version }}
       tag: ${{ steps.read.outputs.tag }}
@@ -127,6 +129,8 @@ jobs:
   quality:
     needs: preflight
     runs-on: ubuntu-latest
+    # Lint, types, tests, lock check, build; never the 360-min default (stromy-org ORG-PLAN-343).
+    timeout-minutes: 20
     # INLINED rather than calling the shared `ci-python.yml`, unlike `ci.yml`.
     # Two reasons, both load-bearing for a RELEASE specifically:
     #
@@ -158,17 +162,28 @@ jobs:
       # RELOCKS when pyproject.toml and uv.lock disagree, so CI would go green
       # against a lockfile it regenerated and threw away.
       - run: uv sync --locked --all-extras
+        # Network install: bounded on its own (stromy-org ORG-PLAN-343).
+        timeout-minutes: 10
 
       - name: Lint
         run: uv run ruff check
       - name: Type check
         run: uv run pyright src/workflow_runtime_core
       - name: Tests
-        run: uv run pytest
+        run: |
+          rm -f .release-junit.xml
+          uv run pytest --junitxml=.release-junit.xml
+          if [ -f .github/test-contract.yml ]; then
+            for step in tests contract; do
+              uv run --no-project --python 3.12 --with pyyaml --with jsonschema python scripts/ci/suite_execution.py --step "$step" --report .release-junit.xml --returncode 0
+            done
+          fi
 
   publish:
     needs: [preflight, quality]
     runs-on: ubuntu-latest
+    # Tag + GitHub release (stromy-org ORG-PLAN-343).
+    timeout-minutes: 10
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
       TAG: ${{ needs.preflight.outputs.tag }}
