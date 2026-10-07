@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "_comment": [
+    "workflow-runtime-core routing table (ORG-PLAN-331 C5). `paths` is stamped into each",
+    "rule's `paths:` frontmatter; `paths` + `commands` + `content` are read by",
+    ".claude/hooks/context-router.sh. The security-critical invariants stay always-on",
+    "in AGENTS.md. After an edit: `python3 scripts/instruction_routes.py --stamp`."
+  ],
+  "routes": [
+    {
+      "rule": "runtime-invariants.md",
+      "paths": ["src/**", "tests/**", "pyproject.toml"],
+      "commands": ["\\bwrc\\b"],
+      "why": "The ten load-bearing invariants, the public API and binding seams, dev patterns and test layout."
+    },
+    {
+      "rule": "database-auth.md",
+      "paths": ["src/workflow_runtime_core/auth.py", "src/workflow_runtime_core/grants.py",
+                "src/workflow_runtime_core/migrations.py", "src/workflow_runtime_core/cli.py"],
+      "commands": ["\\bwrc (migrate|checkpoint-setup|auth-probe)\\b"],
+      "content": ["\\bWRC_PG_[A-Z_]+\\b", "\\bWRC_CHECKPOINT_SETUP\\b"],
+      "why": "The opt-in Entra auth settings and why the credential source has no default."
+    }
+  ]
+}
