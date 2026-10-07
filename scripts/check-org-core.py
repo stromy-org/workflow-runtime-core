@@ -22,6 +22,12 @@ the block and the reference together fails only centrally.
 This file is copied byte-for-byte into every governed repo and scaffold template
 by `render-org-core.py`. Edit the canonical copy in stromy-org/scripts/ only.
 
+It also fails when `AGENTS.md` is over 32,768 bytes, the Codex cloud default
+cap: the tail of a larger file never reaches a cloud session (ORG-PLAN-331 C9).
+The stromy-org control plane is the one exception (it carries `catalog.json`
+and `scripts/render-org-core.py`); its size is governed by the root's own
+instruction gate, so there the same finding is a warning.
+
 Usage:
     check-org-core.py [--repo PATH] --check
 """
@@ -104,13 +110,17 @@ def check(repo: Path) -> list[str]:
     return findings
 
 
-def size_warnings(repo: Path) -> list[str]:
+def size_findings(repo: Path) -> list[str]:
     agents = repo / "AGENTS.md"
     if agents.is_file() and (n := agents.stat().st_size) > CLOUD_CODEX_BYTES:
         return [(f"codex-cloud-truncation: AGENTS.md is {n:,} bytes, over the "
                  f"{CLOUD_CODEX_BYTES:,}-byte Codex cloud default; the tail never reaches "
                  "a cloud session")]
     return []
+
+
+def is_control_plane(repo: Path) -> bool:
+    return (repo / "catalog.json").is_file() and (repo / "scripts/render-org-core.py").is_file()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -122,8 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     repo = args.repo.resolve()
     findings = check(repo)
-    for w in size_warnings(repo):
-        print(f"warning: {w}", file=sys.stderr)
+    size = size_findings(repo)
+    if is_control_plane(repo):
+        for w in size:
+            print(f"warning: {w}", file=sys.stderr)
+    else:
+        findings += size
     for f in findings:
         print(f"FAIL {f}", file=sys.stderr)
     if findings:
