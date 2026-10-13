@@ -82,7 +82,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The ancestry test needs real history; a shallow clone makes
           # `merge-base --is-ancestor` answer about a graph it cannot see.
@@ -150,11 +150,11 @@ jobs:
     #
     # Keep these steps in step with `ci.yml` by hand.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: "latest"
       - run: uv python install 3.11
@@ -188,14 +188,14 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       TAG: ${{ needs.preflight.outputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Pin the exact commit preflight validated and quality tested. The
           # default branch may have moved while those ran; the tag must land on
           # the tree that was actually checked, not on whatever main is now.
           ref: ${{ github.sha }}
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: "latest"
 
@@ -227,7 +227,8 @@ jobs:
           sdist=(dist/*-"${VERSION}".tar.gz)
           wheel=(dist/*-"${VERSION}"-*.whl)
           if [ ${#sdist[@]} -eq 0 ] || [ ${#wheel[@]} -eq 0 ]; then
-            echo "::error::uv build produced no sdist+wheel pair carrying ${VERSION}. dist/ holds: $(ls dist/ | tr '\n' ' ')"
+            echo "::error::uv build produced no sdist+wheel pair carrying ${VERSION}"
+            printf 'dist/ holds: %s\n' dist/*
             exit 1
           fi
           echo "Built: ${sdist[*]} ${wheel[*]}"
