@@ -52,8 +52,7 @@ on:
         default: false
 
 permissions:
-  # Creating the tag and the Release is the only write this workflow makes.
-  contents: write
+  contents: read
 
 concurrency:
   # Two simultaneous releases would race to create the same tag.
@@ -82,17 +81,19 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The ancestry test needs real history; a shallow clone makes
           # `merge-base --is-ancestor` answer about a graph it cannot see.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Refuse a commit that is not reachable from the default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch origin "$DEFAULT_BRANCH" --quiet
+          scripts/release-git.sh fetch origin "$DEFAULT_BRANCH" --quiet
           if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
             echo "::error::${GITHUB_SHA} is not an ancestor of origin/${DEFAULT_BRANCH} — refusing to release unreviewed code."
             exit 1
@@ -119,8 +120,9 @@ jobs:
         # having bumped the version — which this catches BEFORE anything ships.
         env:
           TAG: ${{ steps.read.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+          if scripts/release-git.sh ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "::error::${TAG} already exists. Bump [project].version on the default branch, then dispatch again."
             exit 1
           fi
@@ -149,12 +151,40 @@ jobs:
     #     `event == push` — but relying on that is relying on a detail.)
     #
     # Keep these steps in step with `ci.yml` by hand.
+    env:
+      CI: 'true'
+      STROMY_PG_DSN: postgresql://wrc:wrc@127.0.0.1:5432/wrc
+      STROMY_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wrc
+          POSTGRES_PASSWORD: wrc
+          POSTGRES_DB: wrc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wrc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: "latest"
       - run: uv python install 3.11
@@ -181,6 +211,9 @@ jobs:
 
   publish:
     needs: [preflight, quality]
+    # Only this validated publication context can create tags/releases.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     # Tag + GitHub release (stromy-org ORG-PLAN-343).
     timeout-minutes: 10
@@ -188,14 +221,15 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       TAG: ${{ needs.preflight.outputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Pin the exact commit preflight validated and quality tested. The
           # default branch may have moved while those ran; the tag must land on
           # the tree that was actually checked, not on whatever main is now.
           ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: "latest"
 
@@ -227,7 +261,8 @@ jobs:
           sdist=(dist/*-"${VERSION}".tar.gz)
           wheel=(dist/*-"${VERSION}"-*.whl)
           if [ ${#sdist[@]} -eq 0 ] || [ ${#wheel[@]} -eq 0 ]; then
-            echo "::error::uv build produced no sdist+wheel pair carrying ${VERSION}. dist/ holds: $(ls dist/ | tr '\n' ' ')"
+            echo "::error::uv build produced no sdist+wheel pair carrying ${VERSION}"
+            printf 'dist/ holds: %s\n' dist/*
             exit 1
           fi
           echo "Built: ${sdist[*]} ${wheel[*]}"
@@ -241,11 +276,13 @@ jobs:
 
       - name: Create the tag
         if: '!inputs.dry_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG" "$GITHUB_SHA"
-          git push origin "$TAG"
+          scripts/release-git.sh push origin "$TAG"
 
       - name: Create the GitHub Release
         if: '!inputs.dry_run'

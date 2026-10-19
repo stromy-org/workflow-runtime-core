@@ -42,9 +42,11 @@ default shallow checkout.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -59,7 +61,7 @@ RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 # The predicate that makes a job the ancestry gate, whatever that job is named.
 ANCESTRY_PREDICATE = "merge-base --is-ancestor"
 # The step that first makes the release real and unrecallable.
-TAG_PUSH = 'git push origin "$TAG"'
+TAG_PUSH = 'scripts/release-git.sh push origin "$TAG"'
 
 
 def _release_text() -> str:
@@ -247,7 +249,7 @@ def test_the_release_is_created_after_the_tag() -> None:
 def test_a_version_already_tagged_is_refused() -> None:
     """The one mistake a human can still make: dispatching without bumping."""
     text = _release_text()
-    assert "git ls-remote --exit-code --tags origin" in text, (
+    assert "scripts/release-git.sh ls-remote --exit-code --tags origin" in text, (
         "release.yml must refuse a version whose tag already exists"
     )
 
@@ -300,3 +302,31 @@ def test_predicate_rejects_a_side_branch_tag(repo_with_side_branch: tuple[Path, 
         [GIT, "merge-base", "--is-ancestor", on_side, "origin/main"], cwd=clone
     ).returncode
     assert rc != 0, "a commit that never reached main must fail the gate"
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_workflow_existing_version_guard_executes_against_real_git(
+    repo_with_side_branch: tuple[Path, str, str], tmp_path: Path, exists: bool
+) -> None:
+    """Run the authored shell and credential adapter against a local origin."""
+    clone, _on_main, _on_side = repo_with_side_branch
+    tag = "v99.99.99"
+    if exists:
+        _git(clone.parent / "upstream", "tag", tag)
+    adapter = clone / "scripts/release-git.sh"
+    adapter.parent.mkdir()
+    shutil.copy2(REPO_ROOT / "scripts/release-git.sh", adapter)
+    jobs = _top_level_jobs(_release_text())
+    lookup = "scripts/release-git.sh ls-remote --exit-code --tags origin"
+    step = _step_containing(jobs[_job_containing(jobs, lookup)], lookup)
+    command = textwrap.dedent(step.split("        run: |", 1)[1])
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(  # noqa: S603
+        [bash, "--noprofile", "--norc", "-eo", "pipefail", "-c", command],
+        cwd=clone, env={**os.environ, "GH_TOKEN": "test-not-a-credential",
+                        "RUNNER_TEMP": str(tmp_path), "TAG": tag},
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == (1 if exists else 0), result.stdout + result.stderr
+    assert not list(tmp_path.glob("release-git.*")), "temporary credential glue survived"

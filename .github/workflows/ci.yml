@@ -1,24 +1,6 @@
-# Self-contained on purpose — do NOT convert this back to a call into
-# `stromy-org/stromy-org/.github/workflows/ci-python.yml`.
-#
-# Every other Python satellite calls that shared reusable workflow, and this repo
-# did too until it went public (ORG-PLAN-155 locked decision 3). The control
-# plane that hosts the shared workflow is PRIVATE and this repo is PUBLIC, so the
-# call stopped resolving the moment visibility flipped: the initial run went
-# green while the repo was still private, and every run after the flip failed at
-# 0s with a startup error and no jobs at all.
-#
-# Inlining is the right shape regardless of the mechanics: a public library must
-# be buildable from its own contents by anyone who clones it. Proving a public
-# package correct via a private workflow is a dependency its own consumers cannot
-# satisfy.
-#
-# The cost is real and accepted: this file must be kept in step with
-# ci-python.yml by hand. Keep it minimal so that stays cheap — this repo has no
-# private git+URL dependencies and no `readiness.py`, so the App-token minting and
-# control-plane fetching the shared workflow spends two jobs on have nothing to do
-# here anyway.
-
+# Public library: native checks must remain resolvable without private workflows.
+# One Linux context retains every original unit, API and real-engine assertion.
+# The service recipe is a finite, repository-owned template deviation.
 name: CI
 
 on:
@@ -27,35 +9,21 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  quality:
+  python-ci:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: "latest"
-      - run: uv python install 3.12
-      - run: uv sync --all-extras
-      - name: Lint
-        run: uv run ruff check
-      - name: Type check
-        run: uv run pyright src/workflow_runtime_core/
-
-  test:
-    runs-on: ubuntu-latest
-
-    # Real engines as SERVICE containers rather than leaving every integration
-    # test to spin its own testcontainer. Two reasons, and the second matters
-    # more than the speed:
-    #
-    # 1. One engine for the whole job instead of one per fixture scope.
-    # 2. The broker fixtures fall back to `pytest.importorskip` when their env
-    #    var is unset, and a skip is indistinguishable from a pass in the run
-    #    summary. Pinning the URLs here means that fallback is never reached in
-    #    CI, so the delivery guarantees are always genuinely exercised. NOT-RUN
-    #    is not a pass — the same reasoning as the contract job's refusal to
-    #    tolerate exit 5.
+    timeout-minutes: 15
+    env:
+      CI: 'true'
+      STROMY_PG_DSN: postgresql://wrc:wrc@127.0.0.1:5432/wrc
+      STROMY_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
     services:
       postgres:
         image: postgres:16-alpine
@@ -79,39 +47,39 @@ jobs:
           --health-interval 10s
           --health-timeout 10s
           --health-retries 20
-
-    env:
-      STROMY_PG_DSN: postgresql://wrc:wrc@127.0.0.1:5432/wrc
-      STROMY_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
-
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          version: "latest"
-      - run: uv python install 3.12
-      - run: uv sync --all-extras
-
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: '0.11.26'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install 3.11
+      - name: Install
+        timeout-minutes: 10
+        run: uv sync --locked --all-extras
+      - name: Lint
+        run: uv run ruff check
+      - name: Type check
+        run: uv run pyright src/workflow_runtime_core/
       - name: Unit tests
-        run: uv run pytest tests/unit -v
-
+        run: |
+          rm -f .unit-junit.xml
+          uv run pytest tests/unit -v --junitxml=.unit-junit.xml
+          uv run --no-project --python 3.12 --with pyyaml --with jsonschema python scripts/ci/suite_execution.py --step tests --suite unit --report .unit-junit.xml --returncode 0
       - name: Contract tests
-        # The optional-extra boundary (a base install pulls neither LangGraph nor
-        # aio-pika) is asserted here. That is the package's headline guarantee to
-        # the public facade, so a vacuous pass would be worse than useless —
-        # unlike the shared workflow, this does NOT tolerate exit 5.
-        run: uv run pytest -m contract -v
-
+        run: |
+          rm -f .contract-junit.xml
+          uv run pytest -m contract -v --junitxml=.contract-junit.xml
+          uv run --no-project --python 3.12 --with pyyaml --with jsonschema python scripts/ci/suite_execution.py --step contract --suite contract --report .contract-junit.xml --returncode 0
       - name: Integration tests (real PostgreSQL + RabbitMQ)
-        # Not optional. The one bug this package has actually shipped was a probe
-        # that aborted its caller's transaction on a FRESH database — invisible to
-        # every mock, reproducible only against a real engine, and fatal on the
-        # first boot of every new deployment. The broker guarantees are the same
-        # shape: "an unroutable mandatory publish raises" and "an unacknowledged
-        # delivery is redelivered" are claims about RabbitMQ, and a fake only
-        # proves the fake matches our belief.
-        #
-        # `-ra` surfaces skip reasons in the summary; with the service URLs set
-        # above there should be none, so any skip line here is a signal that a
-        # fixture quietly stopped reaching its engine.
-        run: uv run pytest tests/integration -v -ra
+        # Required: the durable guarantees and fresh-database regression need
+        # real engines. Missing, skipped or reduced execution fails the floor.
+        run: |
+          rm -f .pytest_cache/durable-junit.xml
+          uv run pytest tests/integration -v -ra --junitxml=.pytest_cache/durable-junit.xml
+          uv run --no-project --python 3.12 --with pyyaml --with jsonschema python scripts/ci/suite_execution.py --step tests --suite durable --report .pytest_cache/durable-junit.xml --returncode 0
+      - run: uv lock --check
+      - run: uv build
