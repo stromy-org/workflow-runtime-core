@@ -1,0 +1,10 @@
+schema_version: 1
+deviations:
+  - path: .github/workflows/ci.yml
+    reason: >-
+      One capable Linux context retains the existing 212 unit, eight API
+      contract and 277 real PostgreSQL/RabbitMQ assertions. The generated
+      template has no service/DSN seam for this required durable tier; exact
+      owner floors prevent missing or skipped execution from passing.
+    owner: stromy-org/workflow-runtime-core
+    review_by: 2027-04-01

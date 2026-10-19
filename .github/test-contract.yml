@@ -8,7 +8,7 @@ suites:
     paths: ["tests/unit/**"]
     source_inputs: ["src/**", "pyproject.toml", "uv.lock"]
     required: true
-    minimum_executed: 1
+    minimum_executed: 212
     execution_step: tests
   - id: contract
     owner: stromy-org/workflow-runtime-core
@@ -17,5 +17,14 @@ suites:
     paths: ["tests/contract/**"]
     source_inputs: ["src/**", "pyproject.toml", "uv.lock"]
     required: true
-    minimum_executed: 1
+    minimum_executed: 8
     execution_step: contract
+  - id: durable
+    owner: stromy-org/workflow-runtime-core
+    tier: integration
+    surface: pr
+    paths: ["tests/integration/**"]
+    source_inputs: ["src/**", "tests/**", "pyproject.toml", "uv.lock"]
+    required: true
+    minimum_executed: 277
+    execution_step: tests
