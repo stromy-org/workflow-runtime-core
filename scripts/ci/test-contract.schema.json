@@ -7,12 +7,63 @@
   "properties": {
     "version": {"const": 1},
     "not_applicable_reason": {"type": "string", "minLength": 1},
+    "execution_producer": {
+      "oneOf": [{"$ref": "#/$defs/owning_multi"}, {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "workflow", "job", "steps"],
+      "properties": {
+        "format": {"const": "owning-workflow-v1"},
+        "workflow": {"enum": [".github/workflows/ci.yml", ".github/workflows/ci.yaml"]},
+        "job": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$"},
+        "steps": {
+          "type": "object", "additionalProperties": false, "minProperties": 1,
+          "properties": {
+            "tests": {"$ref": "#/$defs/step_name"},
+            "contract": {"$ref": "#/$defs/step_name"},
+            "node": {"$ref": "#/$defs/step_name"},
+            "browser": {"$ref": "#/$defs/step_name"}
+          }
+        }
+      }
+      }]
+    },
     "suites": {
       "type": "array",
       "items": {"$ref": "#/$defs/suite"}
     }
   },
   "$defs": {
+    "owning_multi": {
+      "type": "object", "additionalProperties": false,
+      "required": ["format", "workflow", "jobs"],
+      "properties": {
+        "format": {"const": "owning-workflow-v2"},
+        "workflow": {"type": "string", "pattern": "^\\.github/workflows/[A-Za-z0-9_-]+\\.ya?ml$"},
+        "jobs": {
+          "type": "object", "minProperties": 1, "maxProperties": 8,
+          "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$"},
+          "additionalProperties": {
+            "type": "object", "additionalProperties": false, "required": ["suites"],
+            "properties": {
+              "reusable_workflow": {"const": "stromy-org/stromy-org/.github/workflows/ci-python.yml"},
+              "native_name": {"$ref": "#/$defs/step_name"},
+              "suites": {
+                "type": "object", "minProperties": 1, "maxProperties": 20,
+                "propertyNames": {"pattern": "^[a-z][a-z0-9_-]*$"},
+                "additionalProperties": {
+                  "type": "object", "additionalProperties": false, "required": ["step", "report"],
+                  "properties": {
+                    "step": {"$ref": "#/$defs/step_name"},
+                    "report": {"type": "string", "pattern": "^[A-Za-z0-9_-]+\\.xml$"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "step_name": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\$\\{\\{)\\S(?:[^\\r\\n]*\\S)?$"},
     "paths": {
       "type": "array", "minItems": 1, "uniqueItems": true,
       "items": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"}

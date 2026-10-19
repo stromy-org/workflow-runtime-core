@@ -85,7 +85,7 @@ packages = ["src/workflow_runtime_core"]
 target-version = "py311"
 line-length = 120
 # Vendored byte for byte from the control plane; tested and linted at its owner.
-extend-exclude = ["scripts/ci/**", "scripts/ci_trigger_paths.py"]
+extend-exclude = ["scripts/ci/**", "scripts/ci_trigger_paths.py", ".github/workflow-lint/**"]
 
 [tool.ruff.lint]
 select = ["ASYNC", "B", "PERF", "S", "E", "F", "W", "I"]

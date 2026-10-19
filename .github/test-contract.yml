@@ -1,0 +1,21 @@
+# Seed once. The repository owns additions; Copier never resets its floors.
+version: 1
+suites:
+  - id: unit
+    owner: stromy-org/workflow-runtime-core
+    tier: deterministic
+    surface: pr
+    paths: ["tests/unit/**"]
+    source_inputs: ["src/**", "pyproject.toml", "uv.lock"]
+    required: true
+    minimum_executed: 1
+    execution_step: tests
+  - id: contract
+    owner: stromy-org/workflow-runtime-core
+    tier: integration
+    surface: pr
+    paths: ["tests/contract/**"]
+    source_inputs: ["src/**", "pyproject.toml", "uv.lock"]
+    required: true
+    minimum_executed: 1
+    execution_step: contract
