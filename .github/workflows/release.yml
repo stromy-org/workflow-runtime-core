@@ -151,6 +151,33 @@ jobs:
     #     `event == push` — but relying on that is relying on a detail.)
     #
     # Keep these steps in step with `ci.yml` by hand.
+    env:
+      CI: 'true'
+      STROMY_PG_DSN: postgresql://wrc:wrc@127.0.0.1:5432/wrc
+      STROMY_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wrc
+          POSTGRES_PASSWORD: wrc
+          POSTGRES_DB: wrc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wrc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
