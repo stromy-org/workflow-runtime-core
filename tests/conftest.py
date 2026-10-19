@@ -52,4 +52,11 @@ def blank_dsn(admin_dsn: str, request: pytest.FixtureRequest):
         conn.execute(f'DROP DATABASE IF EXISTS "{name}"')  # noqa: S608 - generated name
         conn.execute(f'CREATE DATABASE "{name}"')  # noqa: S608 - generated name
     head, _, _tail = admin_dsn.rpartition("/")
-    yield f"{head}/{name}"
+    try:
+        yield f"{head}/{name}"
+    finally:
+        # This fixture created this exact per-run/per-case database. Retaining
+        # every finished case exhausts an ephemeral engine before the suite
+        # finishes; another fixture's database is never a cleanup target.
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}"')  # noqa: S608 - generated name
