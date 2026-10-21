@@ -34,7 +34,7 @@ executor = [
 ]
 # Delivery-bearing ingress / confirmed egress adapters (Phase B).
 rabbitmq = [
-    "aio-pika>=9.4,<10",
+    "aio-pika>=9.4,<11",
 ]
 # Passwordless PostgreSQL via Microsoft Entra tokens (ORG-PLAN-226). OPT-IN and
 # additive: WRC_PG_AUTH defaults to `password`, so a consumer that installs this
