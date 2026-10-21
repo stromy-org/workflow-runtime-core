@@ -24,7 +24,15 @@
 #     (git-guard.sh and generated-guard.sh own the denying. A loader that can deny
 #     would acquire a whole new failure mode for zero benefit.)
 #   - Injects each rule at most ONCE per session, so a long Bash-heavy session does not
-#     re-pay for the same reference on every call.
+#     re-pay for the same reference on every call. "Once" is per session per SOURCE
+#     rule (ORG-PLAN-412 C8): the marker store belongs to the tree FAMILY — a lane or
+#     worktree under <root>/.claude/{lanes,worktrees}/ shares its root's store — and
+#     each marker is namespaced by the rule's repo (its origin), so a session moving
+#     between lanes of one repo is told once, while a same-named rule from a different
+#     repo still loads. Measured before the fix: one session delivered python-repos.md
+#     by router 16 times, exactly once per distinct lane/worktree root it cd'd into.
+#   - A compaction drops injected context, so a SessionStart(compact) event clears THIS
+#     session's markers (and no other session's): each rule loads again, once.
 #   - Reads .claude/instruction-routes.json through scripts/instruction_routes.py, the
 #     same resolver that stamps the frontmatter, so the two triggers cannot drift.
 #
@@ -37,6 +45,28 @@ command -v jq >/dev/null 2>&1 || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 INPUT="$(cat)"
+
+# _family_root <toplevel> -> the tree whose marker store this toplevel shares:
+# the org root for a lane/worktree under <root>/.claude/{lanes,worktrees}/
+# (lexical, like lib.sh's _parent_tree_root — a clone lane's git metadata knows
+# nothing of the tree it came from), else the toplevel itself.
+_family_root() {
+  case "$1" in
+    */.claude/worktrees/*|*/.claude/lanes/*) printf '%s' "${1%%/.claude/*}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# A compaction drops injected context: re-arm THIS session only (ORG-PLAN-412 C8).
+if [ "$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)" = "SessionStart" ]; then
+  [ "$(printf '%s' "$INPUT" | jq -r '.source // empty' 2>/dev/null)" = "compact" ] || exit 0
+  SESSION="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
+  case "$SESSION" in ''|*/*|.|..) exit 0 ;; esac
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+  rm -rf "$(_family_root "$ROOT")/.claude/.instruction-router/$SESSION" 2>/dev/null
+  exit 0
+fi
+
 TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)" || exit 0
 case "$TOOL" in
   Bash|Read|Edit|Write|Grep|Glob) ;;
@@ -68,8 +98,15 @@ if [ "$TOOL" = "Grep" ] || [ "$TOOL" = "Glob" ]; then
 fi
 
 SESSION="$(printf '%s' "$INPUT" | jq -r '.session_id // "nosession"' 2>/dev/null)"
-STATE="$ROOT/.claude/.instruction-router/${SESSION}"
+STATE="$(_family_root "$ROOT")/.claude/.instruction-router/${SESSION}"
 mkdir -p "$STATE" 2>/dev/null || exit 0
+# The rule's source identity: its repo's origin (owner/repo), else its toplevel
+# path — so a lane and its root share it, and another repo's same-named rule
+# does not.
+RULE_NS="$(git -C "$ROOT" config --get remote.origin.url 2>/dev/null \
+  | sed -E 's#^.*github\.com[:/]##; s#\.git$##; s#/+$##')"
+[ -n "$RULE_NS" ] || RULE_NS="$ROOT"
+RULE_NS="$(printf '%s' "$RULE_NS" | tr -c 'A-Za-z0-9._-' '_')"
 
 # Bash command text gets the stricter ORG-PLAN-331 C8 matcher (existence- or
 # mutating-verb-gated); a Read/Edit/Grep/Glob's own structured path argument
@@ -144,11 +181,11 @@ if [ "$TOOL" = "Write" ] || [ "$TOOL" = "Edit" ]; then
 fi
 while IFS= read -r RULE; do
   [ -n "$RULE" ] || continue
-  # once per session per rule
-  [ -e "$STATE/$RULE" ] && continue
+  # once per session per SOURCE rule; the create is atomic (noclobber), so two
+  # concurrent tool calls of one session cannot both inject it
   BODY_FILE="$ROOT/.claude/rules/$RULE"
   [ -f "$BODY_FILE" ] || continue
-  : > "$STATE/$RULE"
+  ( set -C; : > "$STATE/${RULE_NS}__${RULE}" ) 2>/dev/null || continue
   # strip the paths: frontmatter — it is routing metadata, not instruction content
   BODY="$(python3 -c '
 import re,sys
