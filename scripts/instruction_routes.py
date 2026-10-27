@@ -49,6 +49,22 @@ A route may carry three kinds of selector:
               how a new Google Cloud import in `agents/runner.py` reaches the
               Cloud procedure when neither the path nor a command names it
 
+A route may also carry `operations` (ORG-PLAN-482 C3): the subset of `read`,
+`write` and `execute` its PATH selectors fire on. Consuming a skill and
+authoring it are different operations, so an authoring-only procedure is
+scoped to `["write"]` and a read-only `cat`, `sed -n`, `grep` or Read of the
+file no longer injects it. Rules:
+
+    - an absent `operations` field means every operation (the old table shape,
+      so a satellite on an older table behaves exactly as before);
+    - a shell segment whose intent is not a KNOWN read is `unknown`, and an
+      unknown segment fires write-scoped routes too: unknown is never guessed
+      read-only;
+    - `commands` regexes are execute triggers and fire whatever the scope;
+    - a write-scoped rule's frontmatter is stamped with a sentinel glob that
+      matches nothing, so Claude's native loader stops injecting it on every
+      Read while the router delivers it on Edit/Write and mutating shell calls.
+
 Agents that run no Claude hook (Codex, Gemini, Copilot, cloud) read the
 `## Route index` block this script renders into AGENTS.md between
 `<!-- route-index:start -->` and `<!-- route-index:end -->` markers.
@@ -79,7 +95,13 @@ from pathlib import Path
 CI_INPUTS: tuple[str, ...] = (".claude/instruction-routes.json", ".claude/rules/**")
 
 #: Bumped when the portable kit (this file + context-router.sh) changes shape.
-PORTABLE_KIT_VERSION = 1
+PORTABLE_KIT_VERSION = 2
+
+#: The operations a route's path selectors can be scoped to (ORG-PLAN-482 C3).
+OPERATIONS: tuple[str, ...] = ("read", "write", "execute")
+#: Frontmatter glob for a write-scoped rule: matches no file, so the native
+#: Read/Edit loader never injects it; the router owns its delivery.
+ROUTER_ONLY_PREFIX = ".claude/.router-only/"
 
 REPO = Path(__file__).resolve().parent.parent
 TABLE = REPO / ".claude" / "instruction-routes.json"
@@ -105,8 +127,34 @@ def rule_path(route: dict) -> Path:
 
 
 def declared_paths(route: dict) -> list[str]:
-    """The globs a rule's frontmatter should carry, per the table."""
+    """The globs the table routes on (router matching)."""
     return list(route.get("paths", []))
+
+
+def route_operations(route: dict) -> tuple[str, ...]:
+    """The operations a route's path selectors fire on; absent = all."""
+    return tuple(route.get("operations") or OPERATIONS)
+
+
+def write_only(route: dict) -> bool:
+    return route_operations(route) == ("write",)
+
+
+def frontmatter_globs(route: dict) -> list[str]:
+    """The globs a rule's frontmatter should carry: the table's paths, or the
+    router-only sentinel for a write-scoped rule (native Read must not load it)."""
+    if write_only(route):
+        return [ROUTER_ONLY_PREFIX + route["rule"]]
+    return declared_paths(route)
+
+
+def allows(route: dict, operation: str) -> bool:
+    """Does a path selector of this route fire for this operation? `unknown`
+    counts as a possible write, never as a read."""
+    ops = route_operations(route)
+    if operation == "unknown":
+        return "write" in ops or "execute" in ops
+    return operation in ops
 
 
 def frontmatter_paths(text: str) -> list[str] | None:
@@ -137,7 +185,7 @@ def stamp(route: dict) -> bool:
         return False
     text = p.read_text()
     body = FRONTMATTER.sub("", text, count=1)
-    globs = "\n".join(f'  - "{g}"' for g in declared_paths(route))
+    globs = "\n".join(f'  - "{g}"' for g in frontmatter_globs(route))
     new = f"---\npaths:\n{globs}\n---\n{body.lstrip()}"
     if new != text:
         p.write_text(new)
@@ -276,15 +324,58 @@ def _segment_is_mutating(tokens: list[str], raw_segment: str) -> bool:
     return ">" in raw_segment  # redirection: `>` / `>>`, fd-juggling included
 
 
+# Verbs whose segment only READS what it names (ORG-PLAN-482 C3). A segment is
+# `read` only when its verb is here and nothing in it mutates; anything else is
+# `write` (a mutating verb or redirect) or `unknown`. The list is deliberately
+# closed: a verb missing from it costs an extra rule load, never a missed one.
+_READ_VERBS = {
+    "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "test", "[", "[[",
+    "stat", "file", "less", "more", "du", "diff", "cmp", "echo", "printf", "jq", "sort",
+    "uniq", "cut", "nl", "basename", "dirname", "realpath", "readlink", "tree", "shasum",
+    "sha256sum", "md5", "find", "sed", "awk", "for",
+}
+_GIT_READ = {"log", "show", "diff", "status", "ls-files", "grep", "blame", "rev-parse", "cat-file", "ls-tree"}
+_SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "time", "{", "}", "(", ")", "done", "fi"}
+_FIND_ACTIONS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"}
+
+
+def classify_segment(tokens: list[str], raw_segment: str) -> str:
+    """`read`, `write` or `unknown` for one shell segment."""
+    if _segment_is_mutating(tokens, raw_segment):
+        return "write"
+    words = [w for w in raw_segment.split() if w]
+    while words and (words[0] in _SHELL_KEYWORDS or ("=" in words[0] and not words[0].startswith(("-", "/")))):
+        words.pop(0)
+    if not words:
+        return "read"
+    verb = os.path.basename(words[0].strip("\"'"))
+    if verb == "git":
+        sub = next((w for w in words[1:] if not w.startswith("-") and not w.startswith("/")
+                    and words[words.index(w) - 1] not in ("-C", "-c")), "")
+        return "read" if sub in _GIT_READ else "unknown"
+    if verb not in _READ_VERBS:
+        return "unknown"
+    if verb == "sed" and "-n" not in words:
+        return "unknown"
+    if verb == "find" and _FIND_ACTIONS & set(words):
+        return "unknown"
+    return "read"
+
+
 def bash_path_tokens(command: str) -> list[str]:
     """The repo-relative paths a Bash COMMAND names as real subjects.
 
     See the module docstring and the block comment above for why this is
     stricter than `path_tokens()`.
     """
+    return [token for token, _op in bash_path_subjects(command)]
+
+
+def bash_path_subjects(command: str) -> list[tuple[str, str]]:
+    """(repo-relative path, operation) for each real subject of a command."""
     command = _strip_opaque(command)
     cwd: str | None = REPO.as_posix()  # a session starts at the repo root
-    subjects: list[str] = []
+    subjects: list[tuple[str, str]] = []
 
     for raw_segment in _CONTROL_SPLIT.split(command):
         tokens = _TOKEN.findall(raw_segment)
@@ -304,7 +395,8 @@ def bash_path_tokens(command: str) -> list[str]:
             # A bare `cd` never names a subject itself — it only moves `cwd`.
             continue
 
-        mutating = _segment_is_mutating(tokens, raw_segment)
+        operation = classify_segment(tokens, raw_segment)
+        mutating = operation == "write"
         for token in tokens:
             if token.startswith("~"):
                 continue
@@ -317,14 +409,21 @@ def bash_path_tokens(command: str) -> list[str]:
             if resolved is None:
                 continue
             if mutating or (REPO / resolved).exists():
-                subjects.append(resolved)
+                subjects.append((resolved, operation))
     return subjects
 
 
-def matches(route: dict, subject: str, *, kind: str = "path") -> bool:
+def matches(route: dict, subject: str, *, kind: str = "path", operation: str = "unknown") -> bool:
     """Does this route fire for a file path (`kind="path"`) or a Bash command
-    (`kind="bash"`)? See `path_tokens()`/`bash_path_tokens()` for why they differ."""
-    tokens = bash_path_tokens(subject) if kind == "bash" else path_tokens(subject)
+    (`kind="bash"`)? See `path_tokens()`/`bash_path_tokens()` for why they differ.
+
+    `operation` is the tool's own operation for a path subject (Read/Grep/Glob
+    = read, Edit/Write = write); a Bash command classifies each segment itself.
+    Path selectors honour the route's `operations`; command regexes always fire."""
+    if kind == "bash":
+        tokens = [t for t, op in bash_path_subjects(subject) if allows(route, op)]
+    else:
+        tokens = path_tokens(subject) if allows(route, operation) else []
     for g in declared_paths(route):
         candidates = [g]
         # `**/x` must also match a bare root-level `x`. fnmatch does not treat `**`
@@ -360,7 +459,8 @@ def route_index(routes: list[dict]) -> str:
               "above apply either way."), "",
              "| Open | When you touch |", "|---|---|"]
     for r in routes:
-        when = [f"`{g}`" for g in r.get("paths", [])]
+        verb = "edit " if write_only(r) else ""
+        when = [f"{verb}`{g}`" for g in r.get("paths", [])]
         when += [f"a command matching `{rx}`" for rx in r.get("commands", [])]
         when += [f"code containing `{rx}`" for rx in r.get("content", [])]
         cell = ", ".join(when).replace("|", "\\|")
@@ -426,6 +526,9 @@ def check() -> int:
         if name in seen:
             problems.append(f"{name}: declared twice in the table")
         seen.add(name)
+        bad_ops = [op for op in r.get("operations", []) if op not in OPERATIONS]
+        if bad_ops or ("operations" in r and not r["operations"]):
+            problems.append(f"{name}: operations {r.get('operations')!r} must be a non-empty subset of {list(OPERATIONS)}")
         problems.extend(f"{name}: selector {rx!r} is not a valid regex ({err})"
                         for rx in [*r.get("commands", []), *r.get("content", [])]
                         if (err := _regex_error(rx)))
@@ -443,9 +546,9 @@ def check() -> int:
             problems.append(
                 f"{name}: no frontmatter — the rule loads UNCONDITIONALLY, "
                 f"defeating the route (run --stamp)")
-        elif sorted(fm) != sorted(declared_paths(r)):
+        elif sorted(fm) != sorted(frontmatter_globs(r)):
             problems.append(
-                f"{name}: frontmatter {fm} != table {declared_paths(r)} (run --stamp)")
+                f"{name}: frontmatter {fm} != table {frontmatter_globs(r)} (run --stamp)")
 
     # A rule file carrying `paths:` but absent from the table is unreachable by
     # the Bash router — the exact half-covered state this module exists to prevent.
@@ -482,6 +585,8 @@ def main() -> int:
     ap.add_argument("--stamp", action="store_true")
     ap.add_argument("--match", help="Read/Edit/Grep/Glob-style subject (a path or pattern)")
     ap.add_argument("--match-bash", help="Bash `command` subject (stricter precision, C8)")
+    ap.add_argument("--operation", choices=("read", "write", "execute", "unknown"), default="unknown",
+                    help="the tool's operation for --match (Read/Grep/Glob=read, Edit/Write=write)")
     ap.add_argument("--match-content",
                     help="Write/Edit text to scan for `content` selectors; `-` reads stdin")
     args = ap.parse_args()
@@ -500,7 +605,7 @@ def main() -> int:
         return 0
     if args.match:
         for r in load():
-            if matches(r, args.match, kind="path"):
+            if matches(r, args.match, kind="path", operation=args.operation):
                 print(r["rule"])
         return 0
     if args.stamp:
