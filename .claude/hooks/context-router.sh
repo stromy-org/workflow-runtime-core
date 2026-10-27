@@ -35,6 +35,18 @@
 #     session's markers (and no other session's): each rule loads again, once.
 #   - Reads .claude/instruction-routes.json through scripts/instruction_routes.py, the
 #     same resolver that stamps the frontmatter, so the two triggers cannot drift.
+#   - OPERATION-AWARE (ORG-PLAN-482 C3): Read/Grep/Glob are `read`, Edit/Write are
+#     `write`, and a Bash segment is classified by the resolver (`unknown` counts as
+#     a possible write). A route scoped to `write` no longer loads on a read-only
+#     `cat`/`sed -n`/`grep`/Read of its files. Command regexes still always fire.
+#   - DELIVERY STATE (F3): the once-per-session marker is keyed by the rule's
+#     content hash and is created only AFTER the body was read, so a failed read
+#     never marks a rule delivered and an edited rule loads again once. Hosts give
+#     no delivery acknowledgement, so the marker records `emitted`, never
+#     `received`. One call carries at most STROMY_ROUTER_BUDGET bytes of rule
+#     bodies (default 16384) beyond its first rule; a rule over budget is DEFERRED:
+#     the call names it as a mandatory read, records the deferral, and leaves it
+#     unmarked so the next call delivers it.
 #
 # FAIL-OPEN: missing jq/python3/table/rule, unresolvable input, or any resolver error =>
 # exit 0 silently. A loader that breaks the session gets disabled within a week, and that
@@ -112,11 +124,11 @@ RULE_NS="$(printf '%s' "$RULE_NS" | tr -c 'A-Za-z0-9._-' '_')"
 # mutating-verb-gated); a Read/Edit/Grep/Glob's own structured path argument
 # keeps the plain match, since the tool is unambiguously about to touch it
 # whether or not it exists yet (a Write's target cannot exist beforehand).
-if [ "$TOOL" = "Bash" ]; then
-  MATCH_FLAG="--match-bash"
-else
-  MATCH_FLAG="--match"
-fi
+case "$TOOL" in
+  Bash) MATCH_ARGS=(--match-bash) ;;
+  Read|Grep|Glob) MATCH_ARGS=(--operation read --match) ;;
+  *) MATCH_ARGS=(--operation write --match) ;;
+esac
 PAYLOAD=""
 
 # ---- parked / unpublished work on this path (2026-10-02) --------------------
@@ -165,7 +177,7 @@ PY
 ${PARKED}"
 fi
 
-MATCHED="$(python3 "$ROOT/scripts/instruction_routes.py" "$MATCH_FLAG" "$SUBJECT" 2>/dev/null)" || MATCHED=""
+MATCHED="$(python3 "$ROOT/scripts/instruction_routes.py" "${MATCH_ARGS[@]}" "$SUBJECT" 2>/dev/null)" || MATCHED=""
 
 # Content selectors (ORG-PLAN-331 C11): the TEXT a Write/Edit is about to put
 # in a file. A new Google Cloud import in `agents/runner.py` names no Cloud
@@ -179,20 +191,38 @@ if [ "$TOOL" = "Write" ] || [ "$TOOL" = "Edit" ]; then
     MATCHED="$(printf '%s\n%s' "$MATCHED" "$CONTENT_MATCHED")"
   fi
 fi
+BUDGET="${STROMY_ROUTER_BUDGET:-16384}"
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=16384 ;; esac
+EMITTED_BYTES=0
+DEFERRED=""
 while IFS= read -r RULE; do
   [ -n "$RULE" ] || continue
-  # once per session per SOURCE rule; the create is atomic (noclobber), so two
-  # concurrent tool calls of one session cannot both inject it
   BODY_FILE="$ROOT/.claude/rules/$RULE"
   [ -f "$BODY_FILE" ] || continue
-  ( set -C; : > "$STATE/${RULE_NS}__${RULE}" ) 2>/dev/null || continue
-  # strip the paths: frontmatter — it is routing metadata, not instruction content
-  BODY="$(python3 -c '
-import re,sys
-t=open(sys.argv[1]).read()
+  # Read first: line 1 is the content hash, the rest the body with the paths:
+  # frontmatter stripped (routing metadata, not instruction content). A failed
+  # read leaves no marker, so it is retried rather than recorded as delivered.
+  READ="$(python3 -c '
+import hashlib,re,sys
+t=open(sys.argv[1],encoding="utf-8").read()
+print(hashlib.sha256(t.encode()).hexdigest()[:12])
 print(re.sub(r"\A---\n.*?\n---\n","",t,count=1,flags=re.S).strip())
 ' "$BODY_FILE" 2>/dev/null)" || continue
-  [ -n "$BODY" ] || continue
+  HASH="${READ%%$'\n'*}"
+  BODY="${READ#*$'\n'}"
+  [ -n "$BODY" ] && [ "$BODY" != "$READ" ] || continue
+  MARK="$STATE/${RULE_NS}__${RULE}__${HASH}"
+  [ -e "$MARK" ] && continue
+  BODY_BYTES="$(printf '%s' "$BODY" | wc -c | tr -d ' ')"
+  if [ "$EMITTED_BYTES" -gt 0 ] && [ $((EMITTED_BYTES + BODY_BYTES)) -gt "$BUDGET" ]; then
+    DEFERRED="${DEFERRED}${DEFERRED:+, }\`.claude/rules/${RULE}\`"
+    printf '%s\tdeferred\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$RULE" "$BODY_BYTES" >> "$STATE/delivery.log" 2>/dev/null || true
+    continue
+  fi
+  # once per session per SOURCE rule and content hash; the create is atomic
+  # (noclobber), so two concurrent tool calls of one session cannot both inject it
+  ( set -C; printf 'emitted\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$TOOL" "$BODY_BYTES" > "$MARK" ) 2>/dev/null || continue
+  EMITTED_BYTES=$((EMITTED_BYTES + BODY_BYTES))
   PAYLOAD="${PAYLOAD}
 
 --- loaded by context-router (matched \`${SUBJECT:0:80}\`) ---
@@ -209,6 +239,13 @@ ${BODY}"
       >> "$LOGDIR/$(date +%F).tsv" 2>/dev/null || true
   fi
 done <<< "$MATCHED"
+
+if [ -n "$DEFERRED" ]; then
+  PAYLOAD="${PAYLOAD}
+
+--- deferred by context-router (this call already carries ${EMITTED_BYTES} bytes of rules) ---
+REQUIRED before you act on this path: read ${DEFERRED}. They load in full on your next tool call; until you have read them, do not mutate anything they govern."
+fi
 
 # Plain `-n`, not `${PAYLOAD// /}`: bash 3.2's pattern-substitution engine is
 # pathologically slow on a large multibyte string under this session's C.UTF-8
