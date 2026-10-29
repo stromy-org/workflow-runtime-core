@@ -1,13 +1,14 @@
 # Copier answers — DO NOT EDIT BY HAND.
 # Run `uvx copier update --skip-answered` to pull template improvements.
-_commit: v0.8.13
+_commit: v0.9.1
 _src_path: gh:stromy-org/python-library-template
 author_email: william.masquelier@stromy.com.au
 author_name: William Masquelier
 ci_adapter: generated
-ci_release: ci-v5
+ci_release: aa2a210721a0a2dd50cd06bc87535504b71af7f7
+ci_release_track: immutable
 cli_command_name: wrc
-copier_engine_release: ci-v5
+copier_engine_release: aa2a210721a0a2dd50cd06bc87535504b71af7f7
 depends_on_internal_libs: false
 description: 'Client-neutral durable workflow lifecycle: versioned run registry, explicit
     migrations, execution bindings, leases and transactional outbox'
