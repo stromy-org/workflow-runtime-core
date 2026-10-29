@@ -1,9 +1,0 @@
-{
-  "schema_version": 1,
-  "source_sha": "1f2f20e190140a6e1e8ac266271fd702c1a164ea",
-  "files": {
-    "workflow_lint.py": "3427513064d92e9da9a55d0519bf55dc890092107c08339e1db3fb3a6a622d5f",
-    "workflow_yaml.py": "cb91ae287a6332c52e424cbc29bc4a09d005e65ead2fb3bfca3f00fbacc8a472",
-    "install-workflow-lint.sh": "3a3209b5efd7913ee6296e20141c68117747b3a3d68d43c48876adeba7c555a3"
-  }
-}
