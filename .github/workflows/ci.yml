@@ -48,6 +48,26 @@ jobs:
           --health-timeout 10s
           --health-retries 20
     steps:
+      - name: Non-durable test database
+        # Throwaway service DB: crash safety buys nothing, fsyncs cost time.
+        # Runs on the job's own service container only (never a laptop command).
+        shell: bash
+        run: |
+          set -euo pipefail
+          cid=$(docker ps -q --filter publish=5432)
+          test -n "$cid"
+          for s in "fsync = off" "synchronous_commit = off" "full_page_writes = off"; do
+            docker exec "$cid" psql -U wrc -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET $s"
+          done
+          docker exec "$cid" psql -U wrc -v ON_ERROR_STOP=1 -c "SELECT pg_reload_conf()"
+          v=unset
+          for _ in $(seq 1 15); do
+            v=$(docker exec "$cid" psql -U wrc -Atc "SHOW fsync")
+            if [ "$v" = off ]; then exit 0; fi
+            sleep 1
+          done
+          echo "fsync still '$v' after reload" >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
