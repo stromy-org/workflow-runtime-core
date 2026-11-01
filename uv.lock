@@ -1,31 +1,31 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
 name = "aio-pika"
-version = "10.1.0"
+version = "10.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiormq" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2a/77/9f8ae466a9e8d16ee4136bf12fea656160fbfbd32295d1df8248c92e77b8/aio_pika-10.1.0.tar.gz", hash = "sha256:ec340bff09d169a367717a4dd822969dac9cc5e835e22a67020e3613784f3139", size = 86810, upload-time = "2026-09-27T11:28:07.651Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/31/70f0d7a9fe1affc3241d86d24c24714a4a2ac648961efd3d835ef734a6a1/aio_pika-10.2.1.tar.gz", hash = "sha256:e4f77afd9179a3cca5a904c3b0a1190256a36d9f90650db908b1b2245eb27487", size = 101040, upload-time = "2026-10-25T11:47:24.577Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/7d/4204ac838183657bd08ca25d0e6a825d646c50c7941368819a9bbee6411e/aio_pika-10.1.0-py3-none-any.whl", hash = "sha256:8dd8aa4514328876e9208970b7dae3a7650afb3373906a2a530286742ebe0f74", size = 58042, upload-time = "2026-09-27T11:28:06.092Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/ae/f69eb62f240f743d5d3aff659a6ed76077f73b722a0d8f9f9559ab825836/aio_pika-10.2.1-py3-none-any.whl", hash = "sha256:66c85d311e30f1dd3e28109d686c9bf1d9dd1a74582004c7cb7bed284d8fe3b1", size = 61568, upload-time = "2026-10-25T11:47:23.119Z" },
 ]
 
 [[package]]
 name = "aiormq"
-version = "7.2.2"
+version = "7.2.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pamqp" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2d/15/475b169da189c38ce4ba4ebec0cd4ff859f3e0dc17e8abc14552f1b7f456/aiormq-7.2.2.tar.gz", hash = "sha256:1434fba7efc56523684506d3118008aae88ab38383d92da3f9f37d9859256784", size = 77592, upload-time = "2026-10-10T10:29:05.82Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/c3/18ca94e389ba11a17778160780fa25da5e153a1deb787c5158fa48fdbff6/aiormq-7.2.5.tar.gz", hash = "sha256:250dc99381c004e0b9c3a58a38b0fc04564339aa1e05740fcf3a9578fe810fc2", size = 81592, upload-time = "2026-11-01T12:01:44.908Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/71/937ac2016ff02f5a72745318e83ff9d83684a4b2fb8f45e54210b9ffa233/aiormq-7.2.2-py3-none-any.whl", hash = "sha256:977622e8d3ba8d7ced7fd3a74217d24e359975edd920d4c102f9ec183fbc40a4", size = 39769, upload-time = "2026-10-10T10:29:04.198Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/4e/2e4e274d4f717aa38e536dc23388f0e4a3c2929a9d07b941ca539021d417/aiormq-7.2.5-py3-none-any.whl", hash = "sha256:c408686d190d10788ca132899c5ede6b123541bee2ce54ea7167404fac11d779", size = 40696, upload-time = "2026-11-01T12:01:43.45Z" },
 ]
 
 [[package]]
@@ -884,11 +884,11 @@ wheels = [
 
 [[package]]
 name = "pamqp"
-version = "4.0.1"
+version = "5.0.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/31/4c/33a0ddaaac7bc42f9a542dbaaee8b580ceca3f89bf5da7c498d1fa97ff9a/pamqp-4.0.1.tar.gz", hash = "sha256:9dd13b828e346622793981f14a5df817fce5de998c746209d6c0154eb8403970", size = 137192, upload-time = "2026-07-06T16:37:51.732Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/10/3a0d1040a1bac414ef1b4cb9b6f53344b6bc33e57eef287ac58d6dc1d1de/pamqp-5.0.0.tar.gz", hash = "sha256:d76dd4af900802483cda5f318a5328c86a1e9b127159f5455b17d9a0bb658b89", size = 137474, upload-time = "2026-10-30T15:41:57.894Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/14/1dfc08b743ba995a38dee0ea09beb46a05c7fe8ac53d729095905f7bf11d/pamqp-4.0.1-py3-none-any.whl", hash = "sha256:a547f45128b06e42ce8d7a739b0cfcc40f2c724770622eaaff4a3f587b1cf7d0", size = 32773, upload-time = "2026-07-06T16:37:50.623Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/ac/fd44d9085dc1270e9f6a9eae0a08bbc69d8354c66623c647fe45ecd4b97d/pamqp-5.0.0-py3-none-any.whl", hash = "sha256:f426351b57f6a9e453ee27682431e532c44771cb61b4f74018b8a7088f4cac20", size = 32793, upload-time = "2026-10-30T15:41:56.381Z" },
 ]
 
 [[package]]
