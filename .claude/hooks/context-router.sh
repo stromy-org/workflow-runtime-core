@@ -20,7 +20,12 @@
 # is the second trigger: it watches the Bash/Grep path and injects the same rule body.
 #
 # CONTRACT
-#   - ALWAYS allows. This is a loader, not a guard; it never blocks a tool call.
+#   - ALWAYS allows, by emitting no decision (an explicit `allow` would also skip
+#     Claude's permission system). This is a loader, not a guard; it never blocks a tool call.
+#   - AUDIENCE (ORG-PLAN-482 C4): rule bodies go to the model (additionalContext);
+#     the operator gets one line naming what loaded (systemMessage, <=800 bytes),
+#     identical on Claude and Codex. On a Claude Read/Edit/Write it adds only
+#     router-only rules: native frontmatter already loads the rest.
 #     (git-guard.sh and generated-guard.sh own the denying. A loader that can deny
 #     would acquire a whole new failure mode for zero benefit.)
 #   - Injects each rule at most ONCE per session, so a long Bash-heavy session does not
@@ -35,6 +40,26 @@
 #     session's markers (and no other session's): each rule loads again, once.
 #   - Reads .claude/instruction-routes.json through scripts/instruction_routes.py, the
 #     same resolver that stamps the frontmatter, so the two triggers cannot drift.
+#   - OPERATION-AWARE (ORG-PLAN-482 C3): Read/Grep/Glob are `read`, Edit/Write are
+#     `write`, and a Bash segment is classified by the resolver (`unknown` counts as
+#     a possible write). A route scoped to `write` no longer loads on a read-only
+#     `cat`/`sed -n`/`grep`/Read of its files. Command regexes still always fire.
+#   - DELIVERY STATE (F3): the once-per-session marker is keyed by the rule's
+#     content hash and is created only AFTER the body was read, so a failed
+#     read never marks a rule delivered and an edited rule loads again once. Hosts give
+#     no delivery acknowledgement, so the marker records `emitted`, never
+#     `received`.
+#   - DELIVERY TIERS (context-router diet): a delivery is `full` (the body) or
+#     `stub` (title, invariant lines generated from the rule, and a pointer).
+#     A read-only or probing call (cat/grep/ls, --help, status, list, show) on a
+#     `stub_on_read` route gets the stub; a mutating or unknown call, and every
+#     `gated` route (terraform, partner onboarding, asset transport, merges and
+#     deploys, ...), gets the full body. One call carries at most
+#     STROMY_ROUTER_BUDGET bytes of rules (default 16384), the first rule
+#     included; gated rules are exempt, and so is the call's first full rule.
+#     Any other rule over the cap DEGRADES to its stub plus a
+#     mandatory-read pointer; it is never silently dropped. A full delivery
+#     covers later stubs; a stub never blocks a later full delivery.
 #
 # FAIL-OPEN: missing jq/python3/table/rule, unresolvable input, or any resolver error =>
 # exit 0 silently. A loader that breaks the session gets disabled within a week, and that
@@ -112,12 +137,21 @@ RULE_NS="$(printf '%s' "$RULE_NS" | tr -c 'A-Za-z0-9._-' '_')"
 # mutating-verb-gated); a Read/Edit/Grep/Glob's own structured path argument
 # keeps the plain match, since the tool is unambiguously about to touch it
 # whether or not it exists yet (a Write's target cannot exist beforehand).
-if [ "$TOOL" = "Bash" ]; then
-  MATCH_FLAG="--match-bash"
-else
-  MATCH_FLAG="--match"
+case "$TOOL" in
+  Bash) MATCH_ARGS=(--tiers --match-bash) ;;
+  Read|Grep|Glob) MATCH_ARGS=(--tiers --operation read --match) ;;
+  *) MATCH_ARGS=(--tiers --operation write --match) ;;
+esac
+# Native first (ORG-PLAN-482 C4): on a Claude Read/Edit/Write the rule's own
+# `paths:` frontmatter loads it (the table above), so the router adds only the
+# router-only (write-scoped) rules and never a second copy. Codex has no native
+# loader, and Grep/Glob/Bash are the hole the router exists for.
+if [ "${STROMY_HOOK_AGENT:-claude}" != "codex" ]; then
+  case "$TOOL" in Read|Edit|Write) MATCH_ARGS=(--skip-native "${MATCH_ARGS[@]}") ;; esac
 fi
 PAYLOAD=""
+LOADED=""
+PARKED_FLAG=""
 
 # ---- parked / unpublished work on this path (2026-10-02) --------------------
 # Work that was parked (park-wip.sh, incl. local-sync's orphan salvage) or left
@@ -162,10 +196,10 @@ PY
   [ -n "$PARKED" ] && PAYLOAD="
 
 --- parked work on this path (context-router) ---
-${PARKED}"
+${PARKED}" && PARKED_FLAG=1
 fi
 
-MATCHED="$(python3 "$ROOT/scripts/instruction_routes.py" "$MATCH_FLAG" "$SUBJECT" 2>/dev/null)" || MATCHED=""
+MATCHED="$(python3 "$ROOT/scripts/instruction_routes.py" "${MATCH_ARGS[@]}" "$SUBJECT" 2>/dev/null)" || MATCHED=""
 
 # Content selectors (ORG-PLAN-331 C11): the TEXT a Write/Edit is about to put
 # in a file. A new Google Cloud import in `agents/runner.py` names no Cloud
@@ -174,29 +208,69 @@ MATCHED="$(python3 "$ROOT/scripts/instruction_routes.py" "$MATCH_FLAG" "$SUBJECT
 if [ "$TOOL" = "Write" ] || [ "$TOOL" = "Edit" ]; then
   CONTENT_MATCHED="$(printf '%s' "$INPUT" | jq -r '
     [.tool_input.content? // empty, .tool_input.new_string? // empty] | join("\n")' 2>/dev/null \
-    | python3 "$ROOT/scripts/instruction_routes.py" --match-content - 2>/dev/null)" || CONTENT_MATCHED=""
+    | python3 "$ROOT/scripts/instruction_routes.py" --tiers --match-content - 2>/dev/null)" || CONTENT_MATCHED=""
   if [ -n "$CONTENT_MATCHED" ]; then
     MATCHED="$(printf '%s\n%s' "$MATCHED" "$CONTENT_MATCHED")"
   fi
 fi
-while IFS= read -r RULE; do
+BUDGET="${STROMY_ROUTER_BUDGET:-16384}"
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=16384 ;; esac
+EMITTED_BYTES=0
+DEGRADED=""
+STUBBED=""
+NONGATED_FULL=0
+while IFS=$'\t' read -r RULE TIER GATE; do
   [ -n "$RULE" ] || continue
-  # once per session per SOURCE rule; the create is atomic (noclobber), so two
-  # concurrent tool calls of one session cannot both inject it
-  BODY_FILE="$ROOT/.claude/rules/$RULE"
-  [ -f "$BODY_FILE" ] || continue
-  ( set -C; : > "$STATE/${RULE_NS}__${RULE}" ) 2>/dev/null || continue
-  # strip the paths: frontmatter — it is routing metadata, not instruction content
-  BODY="$(python3 -c '
-import re,sys
-t=open(sys.argv[1]).read()
-print(re.sub(r"\A---\n.*?\n---\n","",t,count=1,flags=re.S).strip())
-' "$BODY_FILE" 2>/dev/null)" || continue
-  [ -n "$BODY" ] || continue
+  TIER="${TIER:-full}"; GATE="${GATE:-gated}"
+  [ -f "$ROOT/.claude/rules/$RULE" ] || continue
+  # One resolver call writes the content hash, the body (paths: frontmatter
+  # stripped: routing metadata, not instruction content) and the generated stub
+  # to files, read back with `$(<file)`: bash substitution over a ~30 KB
+  # multibyte string is pathologically slow. A failed read leaves no marker, so
+  # it is retried, not recorded.
+  RDIR="$STATE/.render.$$"
+  python3 "$ROOT/scripts/instruction_routes.py" --render "$RULE" --render-dir "$RDIR" 2>/dev/null || continue
+  HASH="$(<"$RDIR/hash")"
+  BODY="$(<"$RDIR/body")"
+  [ -n "$HASH" ] && [ -n "$BODY" ] || continue
+  MARK="$STATE/${RULE_NS}__${RULE}__${HASH}"
+  # A full delivery of this exact content covers every later call, stub or full.
+  [ -e "$MARK" ] && continue
+  KIND="$TIER"; DEG=""
+  if [ "$KIND" = "full" ] && [ "$GATE" != "gated" ]; then
+    # The byte cap covers EVERY injection in the call, the first stub included.
+    # Exempt: a gated rule (never under-delivered around a gated procedure) and
+    # the call's FIRST full rule (a lone over-cap rule would otherwise
+    # reach a mutating step as a stub). Any other rule over
+    # the cap DEGRADES to its stub and pointer; it is never silently dropped.
+    BODY_BYTES="$(wc -c < "$RDIR/body" | tr -d ' ')"
+    if [ $((EMITTED_BYTES + BODY_BYTES)) -gt "$BUDGET" ] && [ "$NONGATED_FULL" -gt 0 ]; then
+      KIND="stub"; DEG=1
+    fi
+  fi
+  if [ "$KIND" = "stub" ]; then
+    MARK="${MARK}__stub"
+    [ -e "$MARK" ] && continue
+    EMIT="$(<"$RDIR/stub")"
+    STUBBED="${STUBBED}${STUBBED:+, }${RULE}"
+  else
+    EMIT="$BODY"
+    NONGATED_FULL=$((NONGATED_FULL + 1))   # any full body (gated included) ends the first-rule exemption
+  fi
+  if [ "$KIND" = "stub" ]; then EMIT_BYTES="$(wc -c < "$RDIR/stub" | tr -d ' ')"; else EMIT_BYTES="$(wc -c < "$RDIR/body" | tr -d ' ')"; fi
+  # once per session per SOURCE rule, content hash and tier; the create is atomic
+  # (noclobber), so two concurrent tool calls of one session cannot both inject it
+  ( set -C; printf 'emitted\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$TOOL" "$EMIT_BYTES" "$KIND" > "$MARK" ) 2>/dev/null || continue
+  EMITTED_BYTES=$((EMITTED_BYTES + EMIT_BYTES))
+  if [ -n "$DEG" ]; then
+    DEGRADED="${DEGRADED}${DEGRADED:+, }${RULE}"
+    printf '%s\tdegraded\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$RULE" "$BODY_BYTES" >> "$STATE/delivery.log" 2>/dev/null || true
+  fi
+  if [ "$KIND" = "stub" ]; then LOADED="${LOADED}${LOADED:+, }${RULE} (stub)"; else LOADED="${LOADED}${LOADED:+, }${RULE}"; fi
   PAYLOAD="${PAYLOAD}
 
 --- loaded by context-router (matched \`${SUBJECT:0:80}\`) ---
-${BODY}"
+${EMIT}"
 
   # Record the firing. InstructionsLoaded does NOT observe hook-injected content, so
   # without this row a route that fired correctly is indistinguishable from one that
@@ -209,6 +283,14 @@ ${BODY}"
       >> "$LOGDIR/$(date +%F).tsv" 2>/dev/null || true
   fi
 done <<< "$MATCHED"
+rm -rf "$STATE/.render.$$" 2>/dev/null
+
+if [ -n "$DEGRADED" ]; then
+  PAYLOAD="${PAYLOAD}
+
+--- degraded by context-router (this call is capped at ${BUDGET} bytes of rules) ---
+Only the stub of ${DEGRADED} was injected. REQUIRED before you mutate anything it governs: read the named file(s) in full. Their full text loads on a later call that has room, or on your Read."
+fi
 
 # Plain `-n`, not `${PAYLOAD// /}`: bash 3.2's pattern-substitution engine is
 # pathologically slow on a large multibyte string under this session's C.UTF-8
@@ -220,12 +302,26 @@ done <<< "$MATCHED"
 # so the substitution bought nothing this hook needs.
 [ -n "$PAYLOAD" ] || exit 0
 
-python3 - "$PAYLOAD" <<'PY'
+# Audience (ORG-PLAN-482 C4): the rule bodies are model text (additionalContext);
+# the operator gets one bounded line naming what loaded (systemMessage). Both
+# clients show the operator the same line. No permissionDecision: on Claude an
+# `allow` would also skip the permission system for this call, and a loader
+# never decides; the probe showed the context arrives without one.
+python3 - "$PAYLOAD" "$LOADED" "$DEGRADED" "$PARKED_FLAG" "${SUBJECT:0:60}" <<'PY'
 import json, sys
-print(json.dumps({"hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "allow",
-    "additionalContext": sys.argv[1].strip(),
-}}))
+payload, loaded, degraded, parked, subject = sys.argv[1:6]
+parts = []
+if loaded:
+    parts.append(f"loaded {loaded}")
+if degraded:
+    parts.append(f"capped {degraded} to its stub")
+if parked:
+    parts.append("flagged parked work on this path")
+line = f"context-router: {'; '.join(parts)} (for `{subject}`)" if parts else ""
+line = line.encode()[:800].decode(errors="ignore")
+out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": payload.strip()}}
+if line:
+    out["systemMessage"] = line
+print(json.dumps(out))
 PY
 exit 0
