@@ -1,5 +1,10 @@
 # Version-update intake only; security updates are outside cooldown.
 # Ordinary/product/review gates still apply; Docker stays reviewed-only.
+# ORG-PLAN-449 P3C (operator decision 2026-10-22): ONE monthly version-updates
+# group per ecosystem (patch + minor together; the merger treats both alike),
+# majors as individual PRs, `rebase-strategy: disabled` (no repo requires
+# up-to-date branches, and a rebase re-runs CI for no new answer). Security
+# updates are not version updates: they stay ungrouped and open immediately.
 version: 2
 updates:
   - package-ecosystem: "uv"
@@ -12,11 +17,11 @@ updates:
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 3
+    rebase-strategy: "disabled"
     groups:
-      patch:
-        update-types: ["patch"]
-      minor:
-        update-types: ["minor"]
+      version-updates:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
   - package-ecosystem: "github-actions"
     cooldown:
       default-days: 14
@@ -24,6 +29,8 @@ updates:
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 3
+    rebase-strategy: "disabled"
     groups:
       actions:
+        applies-to: version-updates
         patterns: ["*"]
