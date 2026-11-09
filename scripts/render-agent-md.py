@@ -25,8 +25,22 @@ Run from any repo containing AGENTS.md, or pass --repo.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
+
+#: CI_INPUTS — this script's input DOMAIN, in GitHub's `paths:` grammar.
+#: the authored source and overrides it renders FROM, plus the generated
+#: outputs — which `--check` reads back to detect a hand-edit. Listing an
+#: output here is correct precisely because this script also reads it;
+#: what must never be declared is a file it only writes.
+#: Verified by scripts/audit-ci-trigger-coverage.py.
+CI_INPUTS: tuple[str, ...] = (
+    "AGENTS.md",
+    ".agent-overrides/**",
+    "CLAUDE.md",
+    ".github/copilot-instructions.md",
+)
 
 GENERATED_HEADER = """<!--
   GENERATED FILE — DO NOT EDIT.
@@ -44,9 +58,49 @@ TARGETS = [
 ]
 
 
+RATIONALE_BLOCK = re.compile(
+    r"^<!-- rationale:start -->\n(.*?)^<!-- rationale:end -->\n",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def strip_rationale(body: str) -> tuple[str, int]:
+    """Excise `rationale:start/end` regions from a generated target.
+
+    AGENTS.md's own policy is "directives only — the reasoning behind each rule
+    lives behind a pointer", but 15.1% of the file measured as incident narrative
+    (2026-09-04) and prose pointers do not get followed: across 142 sessions, the
+    10 files in docs/operating-rules/ were opened 4 times between them.
+
+    So rather than relocate the rationale and lose it, it stays authored inline in
+    AGENTS.md — which humans, Codex and Gemini read directly — and is excised from
+    the *generated* CLAUDE.md, where every character is billed on every request.
+
+    Excision rather than comment-wrapping is deliberate: Claude Code does strip
+    block-level HTML comments before injection (verified), but an HTML comment may
+    not contain `--`, and this file's prose is full of `--flag` spellings. Wrapping
+    would produce silently malformed output on exactly the passages that mention a
+    command. A pointer comment costs nothing and cannot corrupt.
+    """
+    count = 0
+
+    def repl(m: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return "<!-- rationale excised from this generated file; see AGENTS.md -->\n"
+
+    return RATIONALE_BLOCK.sub(repl, body), count
+
+
 def build_output(agents_body: str, agent: str, override: str | None) -> str:
     header = GENERATED_HEADER.format(agent=agent)
     body = agents_body.rstrip() + "\n"
+    if agent == "claude":
+        body, _ = strip_rationale(body)
+    else:
+        # Non-Claude targets keep the rationale: they are read by humans and by
+        # agents whose context budget this repo does not pay for.
+        body = RATIONALE_BLOCK.sub(lambda m: m.group(1), body)
     if override:
         body += "\n---\n\n## " + agent.capitalize() + "-specific overrides\n\n"
         body += override.rstrip() + "\n"
@@ -92,7 +146,8 @@ def render(repo: Path, *, check: bool, dry_run: bool) -> int:
     if gemini_md.is_file():
         if check:
             print(
-                "drift: GEMINI.md present (no longer generated — delete or move to .agent-overrides/)",
+                "drift: GEMINI.md present (no longer generated — "
+                "delete or move to .agent-overrides/)",
                 file=sys.stderr,
             )
             drift += 1
