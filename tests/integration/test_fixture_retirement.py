@@ -4,10 +4,14 @@ from __future__ import annotations
 import uuid
 
 import psycopg
+import pytest
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
 from tests.conftest import blank_dsn as database_fixture
+
+# Needs a real PostgreSQL: keep it out of the `-m "not integration"` tier.
+pytestmark = pytest.mark.integration
 
 
 def test_finished_fixture_retires_its_database_and_preserves_another(admin_dsn, request):

@@ -23,6 +23,8 @@ migrations actually built, not about what their source says.
 
 from __future__ import annotations
 
+import pytest
+
 from workflow_runtime_core import registry
 from workflow_runtime_core.migrations import apply_migrations
 
@@ -68,6 +70,7 @@ def _foreign_keys_to_runs(dsn: str) -> list[dict[str, object]]:
             return list(cur.fetchall())
 
 
+@pytest.mark.integration
 def test_every_foreign_key_to_runs_cascades_or_is_lineage_guarded(blank_dsn: str) -> None:
     keys = _foreign_keys_to_runs(blank_dsn)
 
@@ -90,6 +93,7 @@ def test_every_foreign_key_to_runs_cascades_or_is_lineage_guarded(blank_dsn: str
     )
 
 
+@pytest.mark.integration
 def test_composite_keys_to_runs_are_not_silently_half_read(blank_dsn: str) -> None:
     """The FK query reads ``conkey[1]``, which tells the truth only for single-column
     keys. A composite key would be reported under its first column alone and could
