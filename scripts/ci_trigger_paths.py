@@ -90,17 +90,32 @@ CI_INPUTS: tuple[str, ...] = (
 DEFAULT_EVENTS = ("pull_request", "push")
 
 
+class WorkflowParseError(ValueError):
+    """One workflow is unreadable; callers conservatively include its checks."""
+
+
 def load(workflow: Path) -> dict:
-    """The parsed workflow, or `{}` when it is not a mapping.
+    """The parsed workflow, or a typed malformed-workflow failure.
 
     Public because the trigger auditor asks this file a second question — which
     scripts do its `run:` steps execute — and a second YAML parse in a second
     module is a second chance for the two to disagree about what the file says.
     """
-    import yaml
+    try:
+        import yaml
+    except ImportError as exc:
+        # The pure path matcher is also used by stdlib-only publisher audits.
+        # Only parsing a workflow requires this optional dependency; callers
+        # must broaden or report unavailable, never interpret it as no jobs.
+        raise ValueError('workflow parser unavailable (PyYAML)') from exc
 
-    data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
-    return data if isinstance(data, dict) else {}
+    try:
+        data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise WorkflowParseError('workflow YAML is malformed') from exc
+    if not isinstance(data, dict):
+        raise WorkflowParseError('workflow is not a mapping')
+    return data
 
 
 def trigger_globs(workflow: Path, events: tuple[str, ...] = DEFAULT_EVENTS
@@ -160,7 +175,11 @@ def push_branch_matches(workflow: Path, branch: str) -> bool:
         on = {k: None for k in on}
     if not isinstance(on, dict) or "push" not in on:
         return False
-    spec = on["push"]
+    return push_spec_branch_matches(on["push"], branch)
+
+
+def push_spec_branch_matches(spec, branch: str) -> bool:
+    """Canonical branch eligibility for an already-read remote push trigger."""
     if not isinstance(spec, dict):
         return True
     if "branches" in spec:
@@ -218,6 +237,34 @@ def push_fires(workflow: Path, branch: str, paths: list[str]) -> bool:
         return any(_filtered_in(p, spec.get("paths") or []) for p in paths)
     if "paths-ignore" in spec:
         return any(not _filtered_in(p, spec.get("paths-ignore") or []) for p in paths)
+    return True
+
+
+def event_fires(workflow: Path, event: str, branch: str, paths: list[str], *, ignore_paths: bool = False) -> bool:
+    """The same ordered matcher for each caller's explicit event context."""
+    if event == 'push' and not ignore_paths:
+        return push_fires(workflow, branch, paths)
+    data = load(workflow)
+    on = data.get('on', data.get(True, {}))
+    if isinstance(on, (str, list)):
+        return event in ([on] if isinstance(on, str) else on)
+    if not isinstance(on, dict) or event not in on:
+        return False
+    spec = on[event]
+    if event in ('schedule', 'workflow_dispatch') or not isinstance(spec, dict):
+        return True
+    if 'branches' in spec and not _filtered_in(branch, spec['branches']):
+        return False
+    if 'branches-ignore' in spec and _filtered_in(branch, spec['branches-ignore']):
+        return False
+    if ignore_paths:
+        return True
+    if not paths:
+        return False
+    if 'paths' in spec:
+        return any(_filtered_in(p, spec['paths']) for p in paths)
+    if 'paths-ignore' in spec:
+        return any(not _filtered_in(p, spec['paths-ignore']) for p in paths)
     return True
 
 

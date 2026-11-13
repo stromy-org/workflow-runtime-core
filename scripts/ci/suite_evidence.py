@@ -179,7 +179,7 @@ def validate(value, contract, *, repo, code_sha, tree_sha, checker_sha, run, now
     return value
 
 
-def record(repo, checker, reports, *, env=None, now=None, job=None):
+def record(repo, checker, reports, *, env=None, now=None, job=None, channel_policy=None):
     env = env if env is not None else os.environ
     now = now or datetime.now(UTC)
     slug, run_id = env.get("GITHUB_REPOSITORY", ""), env.get("GITHUB_RUN_ID", "")
@@ -198,23 +198,31 @@ def record(repo, checker, reports, *, env=None, now=None, job=None):
         raise ValueError("execution contract differs from immutable source")
     contract = load_contract(repo)
     if __package__:
-        from .native_producer import declaration, recipe
+        from .native_producer import channel_parts, channel_release, declaration, part_suites, recipe
     else:
-        from native_producer import declaration, recipe
+        from native_producer import channel_parts, channel_release, declaration, part_suites, recipe
     declared = recipe(contract) if contract is not None else None
     multi = declared is not None and declared['format'] == 'owning-workflow-v2'
+    if multi:
+        part_suites(contract, job)
     shared = multi and job in declared['jobs'] and 'reusable_workflow' in declared['jobs'][job]
     if declared is not None and not shared and checker_sha != code_sha:
         raise ValueError("owning checker is not the executing consumer revision")
-    if multi and (not job or env.get('GITHUB_JOB') != ('checks' if shared else job)):
+    native_job = declared['jobs'][job].get('matrix', {}).get('job', job) if multi and job in declared['jobs'] else job
+    if multi and (not job or env.get('GITHUB_JOB') != ('checks' if shared else native_job)):
         raise ValueError('owning producer job differs from executing native job')
-    if shared:
+    if shared or (multi and 'matrix' in declared['jobs'][job]):
         workflow = declared['workflow']
         raw = subprocess.run(['git', '-C', str(repo), 'show', code_sha + ':' + workflow],
                              capture_output=True, check=False, timeout=10)
         if raw.returncode or len(raw.stdout) > 128_000:
-            raise ValueError('shared owning caller source unavailable')
-        declaration({'files': {workflow: raw.stdout.decode()}}, contract)
+            raise ValueError('owning caller source unavailable')
+        snapshot = {'files': {workflow: raw.stdout.decode()}}
+        declaration(snapshot, contract)
+        if job in channel_parts(snapshot, declared):
+            # The executing checker must be the published release the live
+            # channel records name; a missing policy is unresolvable, not a pass.
+            channel_release(channel_policy, checker_sha)
     suites = owning_suites(contract, slug, job=job)
     bindings = {}
     if multi:
@@ -244,6 +252,8 @@ def record(repo, checker, reports, *, env=None, now=None, job=None):
         raw = {'collected': 0, 'executed': 0, 'skipped': 0, 'failed': 0}
         for case in tree.iter("testcase"):
             context = bindings[owners[0]['id']]['step'] if multi else step
+            if multi and 'matrix' in declared['jobs'][job]:
+                context = job + ':' + context
             identity = (context, case.get('classname'), case.get('name'))
             if not all(identity) or identity in seen:
                 raise ValueError("execution case identity missing or duplicated")
@@ -278,6 +288,94 @@ def record(repo, checker, reports, *, env=None, now=None, job=None):
     return value
 
 
+def _unit_module(unit):
+    """`scripts/tests/test_x.py` -> `scripts.tests.test_x` (pytest's classname root)."""
+    return unit[:-3].replace("/", ".") if unit.endswith(".py") else None
+
+
+def _case_paths(owner):
+    """Every file a dotted pytest owner could name: `a.b.C.test` -> a.py, a/b.py, a/b/C.py."""
+    parts = owner.split(".")
+    return ["/".join(parts[:end]) + ".py" for end in range(1, len(parts) + 1)]
+
+
+def _harness_owner(case):
+    """The repository path a shell-harness case names: its `file`, else its classname.
+
+    Same spellings the floor counter (`execution_contract.junit_counts`)
+    accepts; an absolute path matches no unit, so that harness stays blocked.
+    """
+    return (case.get("file") or case.get("classname") or "").removeprefix("./")
+
+
+def unit_outcomes(report, units, *, scope=None, kind="pytest-file"):
+    """Per-unit outcome and case states from one JUnit report (ORG-PLAN-505 C2).
+
+    `kind` "pytest-file" maps a case to a unit through pytest's dotted
+    classname; "shell-harness" requires the case to name the harness script by
+    its exact repository path (`file` or `classname`), so a renamed or
+    unreported harness is never matched by a guess.
+
+    `units` is the CURRENT expected inventory of pytest-file units. A unit with
+    no case in the report was not reached (fail-fast, a crash, a cancelled job)
+    and is `blocked`, never passed. A case that maps to no expected unit means
+    the inventory is incomplete, so the whole report is refused. `scope` (path
+    globs of the owning suite) lets one report serve several suites: a case
+    that names no file inside the scope belongs to another suite and is left
+    out; a case inside the scope that maps to no unit still refuses the report.
+    """
+    if scope is not None:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import ci_trigger_paths
+        scope = list(scope)
+    if kind not in {"pytest-file", "shell-harness"}:
+        raise ValueError(f"unknown unit kind {kind!r}")
+    harness = kind == "shell-harness"
+    modules = {}
+    for unit in units:
+        module = unit if harness else _unit_module(unit)
+        if module is None:
+            raise ValueError(f"unit {unit!r} is not a pytest file unit")
+        modules[module] = unit
+    body = Path(report).read_bytes()
+    if len(body) > 4_000_000 or b"<!DOCTYPE" in body.upper() or b"<!ENTITY" in body.upper():
+        raise ValueError("execution report unavailable or unsafe")
+    tree = ET.fromstring(body)
+    if tree.tag not in {"testsuite", "testsuites"}:
+        raise ValueError("execution report root unavailable")
+    cases = {unit: {} for unit in units}
+    for case in tree.iter("testcase"):
+        classname, name = case.get("classname") or "", case.get("name") or ""
+        # A collection error has an empty classname and the module as its name.
+        owner = _harness_owner(case) if harness else classname or name
+        matches = ([m for m in modules if owner == m] if harness
+                   else [m for m in modules if owner == m or owner.startswith(m + ".")])
+        if not name or not matches:
+            paths = [owner] if harness else _case_paths(owner)
+            if scope is not None and name and not any(
+                    ci_trigger_paths.matches(path, glob) for path in paths for glob in scope):
+                continue
+            raise ValueError("report case outside the current unit inventory")
+        unit = modules[max(matches, key=len)]
+        identity = hashlib.sha256(json.dumps([classname, name], separators=(",", ":")).encode()).hexdigest()
+        if identity in cases[unit]:
+            raise ValueError("execution case identity duplicated")
+        if case.find("failure") is not None or case.find("error") is not None:
+            cases[unit][identity] = "failed"
+        elif case.find("skipped") is not None:
+            cases[unit][identity] = "skipped"
+        else:
+            cases[unit][identity] = "passed"
+    out = {}
+    for unit, states in cases.items():
+        values = set(states.values())
+        outcome = ("blocked" if not states else "failed" if "failed" in values
+                   else "passed" if "passed" in values else "runtime-skipped")
+        out[unit] = {"outcome": outcome, "cases": dict(sorted(states.items()))}
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -285,8 +383,10 @@ def main():
     parser.add_argument("--junit", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument('--job', help='declared owning-workflow-v2 native job identity')
+    parser.add_argument('--channel-policy', type=Path,
+                        help='live checkout of the shared-CI channel records (maintenance/ci-*.json)')
     args = parser.parse_args()
-    value = record(args.repo, args.checker, args.junit, job=args.job)
+    value = record(args.repo, args.checker, args.junit, job=args.job, channel_policy=args.channel_policy)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
     print("suite-evidence: actual source/run-bound counts retained")
