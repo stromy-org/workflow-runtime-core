@@ -40,13 +40,24 @@
         "format": {"const": "owning-workflow-v2"},
         "workflow": {"type": "string", "pattern": "^\\.github/workflows/[A-Za-z0-9_-]+\\.ya?ml$"},
         "jobs": {
-          "type": "object", "minProperties": 1, "maxProperties": 8,
+          "type": "object", "minProperties": 1, "maxProperties": 16,
           "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$"},
           "additionalProperties": {
             "type": "object", "additionalProperties": false, "required": ["suites"],
             "properties": {
               "reusable_workflow": {"const": "stromy-org/stromy-org/.github/workflows/ci-python.yml"},
               "native_name": {"$ref": "#/$defs/step_name"},
+              "matrix": {
+                "type": "object", "additionalProperties": false, "required": ["job", "values"],
+                "properties": {
+                  "job": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$"},
+                  "values": {
+                    "type": "object", "minProperties": 1, "maxProperties": 12,
+                    "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$"},
+                    "additionalProperties": {"type": ["string", "integer", "boolean"]}
+                  }
+                }
+              },
               "suites": {
                 "type": "object", "minProperties": 1, "maxProperties": 20,
                 "propertyNames": {"pattern": "^[a-z][a-z0-9_-]*$"},
@@ -64,6 +75,14 @@
       }
     },
     "step_name": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^(?!.*\\$\\{\\{)\\S(?:[^\\r\\n]*\\S)?$"},
+    "units": {
+      "type": "object", "additionalProperties": false, "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["pytest-file", "shell-harness"]},
+        "hermeticity": {"enum": ["declared", "unknown", "external-state"]},
+        "reads": {"$ref": "#/$defs/paths"}
+      }
+    },
     "paths": {
       "type": "array", "minItems": 1, "uniqueItems": true,
       "items": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"}
@@ -82,7 +101,8 @@
         "minimum_executed": {"type": "integer", "minimum": 0},
         "execution_step": {"enum": ["tests", "contract", "browser", "node"]},
         "exclusion_reason": {"type": "string", "minLength": 1},
-        "receiver": {"type": "string", "minLength": 1}
+        "receiver": {"type": "string", "minLength": 1},
+        "units": {"$ref": "#/$defs/units"}
       },
       "allOf": [
         {"if": {"properties": {"required": {"const": true}}},

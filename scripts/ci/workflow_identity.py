@@ -25,6 +25,20 @@ TARGETS = {
     "explain-pin.yml": "always()",
     "copier-update.yml": "steps.token.outputs.available == 'true'",
 }
+LIVE_CONTRACT_DATA = ("scripts/skill-health-manifest.json",)
+# Published resolvers predate channel engine refs. Recognize their exact bytes
+# only at observed immutable sources; current render changes must not make a
+# frozen release's inventory unknowable. All mount checks still run.
+FROZEN_CHECKER_BOOTSTRAPS = {
+    '3b43e72210fa1a2d6b6c7a8a223dba2e970a500b':
+        '422811368363234e0396a5eea07ab34e91d9f47cf780c875f28dfc7866a6ed96',
+    '1f2f20e190140a6e1e8ac266271fd702c1a164ea':
+        '422811368363234e0396a5eea07ab34e91d9f47cf780c875f28dfc7866a6ed96',
+    '62044aadf97caa7360d4bb24dc50cf7e0a77d703':
+        '422811368363234e0396a5eea07ab34e91d9f47cf780c875f28dfc7866a6ed96',
+    '9175bec6b3edccd9b6aef74ee3fa4c8f38e6e47a':
+        '422811368363234e0396a5eea07ab34e91d9f47cf780c875f28dfc7866a6ed96',
+}
 
 
 def resolve(value, *, repo, run_id, workflow):
@@ -69,11 +83,12 @@ def bootstrap():
     sha = resolve(json.loads(response.stdout), repo=repo, run_id=run_id, workflow=workflow)
     expected = os.environ.get("CHECKER_EXPECTED_REF")
     if expected:
-        if not re.fullmatch(r"(?:copier-fleet-v[1-9][0-9]*|ci-v[1-9][0-9]*(?:\.[1-9][0-9]*)?)", expected):
-            raise ValueError("engine ref is not a registered release tag")
+        if expected != 'ci-stable' and not re.fullmatch(r"(?:copier-fleet-v[1-9][0-9]*|ci-v[1-9][0-9]*(?:\.[1-9][0-9]*)?)", expected):
+            raise ValueError("engine ref is not a registered release or CI channel")
         rows = json.loads(response.stdout)["referenced_workflows"]
         match = next(row for row in rows if row["path"].partition("@")[0] == workflow)
-        if match["path"].partition("@")[2] not in {expected, "refs/tags/" + expected}:
+        namespace = 'refs/heads/' if expected == 'ci-stable' else 'refs/tags/'
+        if match["path"].partition("@")[2] not in {expected, namespace + expected}:
             raise ValueError("engine ref differs from the actual called workflow")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("sha=" + sha + "\n")
@@ -109,7 +124,10 @@ def checker_namespace(value, *, repo, workflow, source_sha):
                 return False
             if step.get("id") == "checker-revision":
                 env = step.get("env")
-                resolved = (step.get("run") == expected and isinstance(env, dict)
+                body = step.get('run')
+                known = (body == expected or isinstance(body, str) and hashlib.sha256(body.encode()).hexdigest()
+                         == FROZEN_CHECKER_BOOTSTRAPS.get(source_sha))
+                resolved = (known and isinstance(env, dict)
                     and set(env) == {"GH_TOKEN", "CHECKER_WORKFLOW"}
                     and env.get("CHECKER_WORKFLOW") == repo + "/" + workflow
                     and env.get("GH_TOKEN") == "${{ github.token }}"
@@ -174,12 +192,14 @@ def render_workflows(root=ROOT, *, check=False):
     return changed
 
 
-def bind_parent(checker: Path, data: Path, sha: str):
+def bind_parent(checker: Path, data: Path, sha: str, *, co_versioned: bool = False):
     """Overlay released helpers into the live tree without replacing its contracts.
 
     Root-derived checker paths keep seeing the current catalog/ledgers and the
     caller mount. The separate checker checkout remains intact for verification.
     Both identities and every copied helper digest are retained before execution.
+    `co_versioned` (ORG-PLAN-557 C2, decision D4) additionally requires the data
+    checkout to sit at the checker SHA, so a frozen checker never reads newer data.
     """
     checker, data = checker.resolve(), data.resolve()
     if checker == data or checker.is_relative_to(data) or data.is_relative_to(checker):
@@ -194,10 +214,22 @@ def bind_parent(checker: Path, data: Path, sha: str):
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or head(checker) != sha:
         raise ValueError("released checker checkout identity differs")
     data_sha = head(data)
+    if co_versioned and data_sha != sha:
+        raise ValueError("checker and contract data are not co-versioned")
     status = subprocess.run(["git", "-C", str(data), "status", "--porcelain=v1", "--untracked-files=all"],
                             capture_output=True, text=True, timeout=15, check=True)
     if status.stdout.strip():
         raise ValueError("live contract data is not a fresh clean checkout")
+    live_files = {}
+    for rel in LIVE_CONTRACT_DATA:
+        path = data / rel
+        if (not path.is_file() or not path.resolve().is_relative_to(data)
+                or any(p.is_symlink() for p in (path, *path.parents) if p != data.parent)
+                or path.stat().st_size > 8_000_000):
+            raise ValueError(f"live contract data unavailable: {rel}")
+        subprocess.run(["git", "-C", str(data), "ls-files", "--error-unmatch", "--", rel],
+                       capture_output=True, timeout=10, check=True)
+        live_files[rel] = path.read_bytes()
     subprocess.run(["git", "-C", str(checker), "diff", "--exit-code", sha, "--", "scripts"],
                    capture_output=True, timeout=15, check=True)
     tree = subprocess.run(["git", "-C", str(checker), "ls-tree", "-rz", sha, "--", "scripts"],
@@ -209,6 +241,8 @@ def bind_parent(checker: Path, data: Path, sha: str):
             continue
         metadata, rel = entry.split("\t", 1)
         mode, kind, _oid = metadata.split()
+        if rel in LIVE_CONTRACT_DATA:
+            continue
         if (mode not in {"100644", "100755"} or kind != "blob" or not rel.startswith("scripts/")
                 or ".." in Path(rel).parts or rel in files):
             raise ValueError("checker helper entry is not a regular unique source")
@@ -236,7 +270,13 @@ def bind_parent(checker: Path, data: Path, sha: str):
         target = data / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(checker / rel, target)
-    record = {"schema": 1, "checker_sha": sha, "data_sha": data_sha, "files": files}
+    for rel, body in live_files.items():
+        target = data / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    record = {"schema": 1, "checker_sha": sha, "data_sha": data_sha, "files": files,
+              "live_files": {rel: hashlib.sha256(body).hexdigest()
+                             for rel, body in live_files.items()}}
     (data / ".checker-identity.json").write_text(json.dumps(record, sort_keys=True) + "\n")
     return record
 
@@ -250,12 +290,14 @@ def main(argv=None):
     bind.add_argument("--checker", type=Path, required=True)
     bind.add_argument("--data", type=Path, required=True)
     bind.add_argument("--sha", required=True)
+    bind.add_argument("--co-versioned", action="store_true",
+                      help="refuse unless the data checkout is at the checker SHA (D4)")
     args = parser.parse_args(argv)
     if args.command == "render":
         changed = render_workflows(check=args.check)
         print("checker bootstrap " + ("stale: " + ", ".join(changed) if args.check and changed else "current"))
         return int(args.check and bool(changed))
-    bind_parent(args.checker, args.data, args.sha)
+    bind_parent(args.checker, args.data, args.sha, co_versioned=args.co_versioned)
     print("released checker bound to fresh contract data")
     return 0
 
